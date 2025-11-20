@@ -1,4 +1,4 @@
-//! Iterates through all possible valid address ranges for a `jmp rel32` instruction based on a
+//! Iterates through all possible valid address ranges for a `jmp rel33` instruction based on a
 //! 4-byte pattern of "free" and "used" bytes.
 //!
 //! This is the core utility for implementing E9Patch-style instruction punning (B2) and padded
@@ -48,9 +48,9 @@ trailing_free_count: u8,
 
 /// Initializes the iterator.
 /// - `patch_bytes`: The 4-byte pattern of the `rel32` offset, in little-endian order.
-/// - `offset`: The address of the *next* instruction (i.e., `RIP` after the 5-byte `jmp`).
-///   All returned ranges will be relative to this offset.
-pub fn init(patch_bytes: [patch_size]PatchByte, offset: u64) PatchLocationIterator {
+/// The base address (e.g., RIP of the *next* instruction) that the 32-bit relative offset is
+/// calculated from.
+pub fn init(patch_bytes: [patch_size]PatchByte, addr: u64) PatchLocationIterator {
     log.debug("hi", .{});
     assert(patch_bytes.len == patch_size);
 
@@ -80,7 +80,7 @@ pub fn init(patch_bytes: [patch_size]PatchByte, offset: u64) PatchLocationIterat
     }
 
     const out = PatchLocationIterator{
-        .offset = @intCast(offset),
+        .offset = @intCast(addr),
         .patch_bytes = patch_bytes,
         .trailing_free_count = trailing_free,
         .start = start,
@@ -110,7 +110,7 @@ pub fn next(self: *PatchLocationIterator) ?Range {
     if (self.trailing_free_count == patch_size) {
         if (self.first) {
             const range = Range{ .start = self.offset, .end = self.offset + std.math.maxInt(i32) };
-            log.debug("next: All bytes free, returning full positive range: {}", .{range});
+            log.debug("next: All bytes free, returning full positive range: {f}", .{range});
             return range;
         } else {
             log.info("next: All bytes free, iteration finished.", .{});
@@ -123,7 +123,7 @@ pub fn next(self: *PatchLocationIterator) ?Range {
             .start = std.mem.readInt(PatchInt, self.start[0..], .little) + self.offset,
             .end = std.mem.readInt(PatchInt, self.end[0..], .little) + self.offset,
         };
-        log.debug("next: First call, returning initial range: {}", .{range});
+        log.debug("next: First call, returning initial range: {f}", .{range});
         return range;
     }
 
@@ -160,7 +160,7 @@ pub fn next(self: *PatchLocationIterator) ?Range {
         .start = start + self.offset,
         .end = end + self.offset,
     };
-    log.debug("next: new range: {}", .{range});
+    log.debug("next: new range: {f}", .{range});
     return range;
 }
 

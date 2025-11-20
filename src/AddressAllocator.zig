@@ -42,7 +42,7 @@ pub fn block(
         Range.compare,
     );
     log.debug(
-        "block: range: {}, alignment: {}, aligned_range: {}, insert_idx: {}",
+        "block: range: {f}, alignment: {}, aligned_range: {f}, insert_idx: {}",
         .{ range, alignment, aligned_range, insert_idx },
     );
     // If the new range is the greatest one OR if the entry at `insert_idx` is greater than the
@@ -78,7 +78,7 @@ pub fn block(
         return;
     } else if (aligned_range.contains(first.*)) {
         log.debug(
-            "block: New range contains existing range at index {}: {} -> {}",
+            "block: New range contains existing range at index {}: {f} -> {f}",
             .{ insert_idx, first, aligned_range },
         );
         first.* = aligned_range;
@@ -117,7 +117,7 @@ pub fn block(
             first.end = neighbor.end;
         }
         const removed = address_allocator.ranges.orderedRemove(insert_idx + 1);
-        log.debug("block: Removed merged range: {}", .{removed});
+        log.debug("block: Removed merged range: {f}", .{removed});
         i += 1;
     }
     log.debug("block: Removed {} ranges.", .{i});
@@ -131,7 +131,7 @@ pub fn allocate(
     size: u64,
     valid_range: Range,
 ) !?Range {
-    log.debug("allocate: Allocating size {} in range {}", .{ size, valid_range });
+    log.debug("allocate: Allocating size {} in range {f}", .{ size, valid_range });
     if (valid_range.size() < size) return null;
     if (size == 0) return null;
     const size_i: i64 = @intCast(size);
@@ -157,7 +157,7 @@ pub fn allocate(
                 };
                 try address_allocator.block(gpa, new_range, 0);
                 assert(valid_range.contains(new_range));
-                log.debug("allocate: Found free gap: {}", .{new_range});
+                log.debug("allocate: Found free gap: {f}", .{new_range});
                 return new_range;
             }
         }
@@ -175,7 +175,7 @@ pub fn allocate(
         };
         try address_allocator.block(gpa, new_range, 0);
         assert(valid_range.contains(new_range));
-        log.debug("allocate: Found free gap at end: {}", .{new_range});
+        log.debug("allocate: Found free gap at end: {f}", .{new_range});
         return new_range;
     }
 
