@@ -12,6 +12,7 @@ const AddressAllocator = @import("AddressAllocator.zig");
 const InstructionFormatter = disassembler.InstructionFormatter;
 const InstructionIterator = disassembler.InstructionIterator;
 const PatchLocationIterator = @import("PatchLocationIterator.zig");
+const PatchByte = PatchLocationIterator.PatchByte;
 const Range = @import("Range.zig");
 
 const assert = std.debug.assert;
@@ -29,6 +30,7 @@ const avg_ins_bytes = 4;
 // TODO: Find an invalid instruction to use.
 // const invalid: u8 = 0xaa;
 const int3: u8 = 0xcc;
+const nop: u8 = 0x90;
 
 // Prefixes for Padded Jumps (Tactic T1)
 const prefix_fs: u8 = 0x64;
@@ -84,12 +86,27 @@ pub const Flicken = struct {
     }
 };
 
-pub const FlickenId = enum(u64) { nop = 0, _ };
+pub const FlickenId = enum(u64) {
+    /// The nop flicken is special. It just does the patched instruction and immediately jumps back
+    /// to the normal instruction stream. It **cannot** be changed.
+    /// The bytes are always empty, meaning that `bytes.len == 0`.
+    /// It also needs special handling when constructing the patches, because it's different for
+    /// each instruction.
+    // TODO: implement the special handling
+    nop = 0,
+    _,
+};
 
+/// Must point to first byte of an instruction.
 pub const PatchRequest = struct {
-    /// Must point to first byte of an instruction.
+    /// What to patch with.
     flicken: FlickenId,
-    /// Bytes of the instruction. Can be used to get the address of the instruction.
+    /// Offset within the region.
+    offset: u64,
+    /// Number of bytes of instruction.
+    size: u8,
+    /// A byte slice from the start of the offset to the end of the region. This isn't necessary to
+    /// have but makes this more accessible.
     bytes: []u8,
 
     pub fn desc(_: void, lhs: PatchRequest, rhs: PatchRequest) bool {
@@ -129,10 +146,12 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         while (instruction_iterator.next()) |instruction| {
             const should_patch: bool = instruction.instruction.attributes & zydis.ZYDIS_ATTRIB_HAS_LOCK > 0;
             if (should_patch) {
-                const start = instruction.address - @intFromPtr(region.ptr);
+                const offset = instruction.address - @intFromPtr(region.ptr);
                 const request: PatchRequest = .{
-                    .bytes = region[start..][0..instruction.instruction.length],
                     .flicken = .nop,
+                    .offset = offset,
+                    .size = instruction.instruction.length,
+                    .bytes = region[offset..],
                 };
                 try patch_requests.append(arena, request);
             }
@@ -145,26 +164,27 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
 
     {
         // Check for duplicate patch requests and undefined IDs
-        var last_address: ?[*]u8 = null;
+        var last_offset: ?u64 = null;
         for (patch_requests.items, 0..) |request, i| {
-            if (last_address) |last| {
-                if (last == request.bytes.ptr) {
-                    var buffer: [256]u8 = undefined;
-                    const fmt = disassembler.formatBytes(request.bytes, &buffer);
-                    log.err(
-                        "patchRegion: Found duplicate patch requests for instruction: {s}",
-                        .{fmt},
-                    );
-                    log.err("patchRegion: request 1: {f}", .{patch_requests.items[i - 1]});
-                    log.err("patchRegion: request 2: {f}", .{patch_requests.items[i]});
-                    return error.DuplicatePatchRequest;
-                }
+            if (last_offset != null and last_offset.? == request.offset) {
+                var buffer: [256]u8 = undefined;
+                const fmt = disassembler.formatBytes(request.bytes, &buffer);
+                log.err(
+                    "patchRegion: Found duplicate patch requests for instruction: {s}",
+                    .{fmt},
+                );
+                log.err("patchRegion: request 1: {f}", .{patch_requests.items[i - 1]});
+                log.err("patchRegion: request 2: {f}", .{patch_requests.items[i]});
+                return error.DuplicatePatchRequest;
             }
-            last_address = request.bytes.ptr;
+            last_offset = request.offset;
 
             if (@as(u64, @intFromEnum(request.flicken)) >= patcher.flicken.count()) {
                 var buffer: [256]u8 = undefined;
-                const fmt = disassembler.formatBytes(request.bytes, &buffer);
+                const fmt = disassembler.formatBytes(
+                    request.bytes[0..request.size],
+                    &buffer,
+                );
                 log.err(
                     "patchRegion: Usage of undefined flicken in request {f} for instruction: {s}",
                     .{ request, fmt },
@@ -177,8 +197,11 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
     {
         // Apply patches.
         try posix.mprotect(region, posix.PROT.READ | posix.PROT.WRITE);
-        defer posix.mprotect(region, posix.PROT.READ | posix.PROT.EXEC) catch
-            @panic("patchRegion: mprotect back to R|X failed. Can't continue");
+        defer {
+            log.info("mprotect region: {*}", .{region});
+            posix.mprotect(region, posix.PROT.READ | posix.PROT.EXEC) catch
+                @panic("patchRegion: mprotect back to R|X failed. Can't continue");
+        }
 
         // PERF: A set of the pages for the patches/flicken we made writable. This way we don't
         // repeatedly change call `mprotect` on the same page to switch it from R|W to R|X and back.
@@ -186,87 +209,208 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         var pages_made_writable: std.AutoHashMapUnmanaged(u64, void) = .empty;
         for (patch_requests.items) |request| {
             const flicken = patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
-            if (request.bytes.len < 5) continue; // TODO:
-
-            var iter = PatchLocationIterator.init(
-                .{ .free, .free, .free, .free },
-                @intFromPtr(request.bytes.ptr),
+            var pii = PatchInstructionIterator.init(
+                request.bytes,
+                request.size,
+                flicken.size(),
             );
-            while (iter.next()) |valid_range| {
-                const patch_range = try patcher.address_allocator.allocate(
-                    patcher.gpa,
-                    flicken.size(),
-                    valid_range,
-                ) orelse continue;
-                assert(patch_range.size() == flicken.size());
-
-                {
-                    // Map patch_range as R|W.
-                    const start_page = mem.alignBackward(u64, patch_range.getStart(u64), page_size);
-                    const end_page = mem.alignBackward(u64, patch_range.getEnd(u64), page_size);
-                    const protection = posix.PROT.READ | posix.PROT.WRITE;
-                    var page_addr = start_page;
-                    while (page_addr <= end_page) : (page_addr += page_size) {
-                        // If the page is already writable we don't need to do anything;
-                        if (pages_made_writable.get(page_addr)) |_| continue;
-
-                        const gop = try patcher.allocated_pages.getOrPut(patcher.gpa, page_addr);
-                        if (gop.found_existing) {
-                            const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr);
-                            try posix.mprotect(ptr[0..page_size], protection);
-                        } else {
-                            const addr = try posix.mmap(
-                                @ptrFromInt(page_addr),
-                                page_size,
-                                protection,
-                                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = true },
-                                -1,
-                                0,
-                            );
-                            assert(@as(u64, @intFromPtr(addr.ptr)) == page_addr);
-                            // `gop.value_ptr.* = {};` is not needed because it's void.
-                        }
-                        try pages_made_writable.put(patcher.gpa, page_addr, {});
+            pii: while (try pii.next(patcher.gpa, &patcher.address_allocator)) |allocated_range| {
+                // Ensure `allocated_range` is mapped R|W.
+                const start, const end = pageRange(allocated_range);
+                const protection = posix.PROT.READ | posix.PROT.WRITE;
+                var page_addr = start;
+                while (page_addr < end) : (page_addr += page_size) {
+                    // If the page is already writable, skip it.
+                    if (pages_made_writable.get(page_addr)) |_| continue;
+                    // If we mapped it already we have to do mprotect, else mmap.
+                    const gop = try patcher.allocated_pages.getOrPut(patcher.gpa, page_addr);
+                    if (gop.found_existing) {
+                        const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr);
+                        try posix.mprotect(ptr[0..page_addr], protection);
+                    } else {
+                        const addr = posix.mmap(
+                            @ptrFromInt(page_addr),
+                            page_size,
+                            protection,
+                            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = true },
+                            -1,
+                            0,
+                        ) catch |err| switch (err) {
+                            error.MappingAlreadyExists => {
+                                // If the mapping exists this means that the someone else
+                                // (executable, OS, dynamic loader,...) allocated something there.
+                                // We block this so we don't try this page again in the future,
+                                // saving a bunch of syscalls.
+                                try patcher.address_allocator.block(
+                                    patcher.gpa,
+                                    .{ .start = @intCast(page_addr), .end = @intCast(page_addr + page_size) },
+                                    page_size,
+                                );
+                                // PERF: In theory we could set a flag and do the continue outside
+                                // of this inner loop. This would make this a bit faster, since
+                                // notice a bunch of pages being allocated, instead of just one by
+                                // one. But in practice the Flicken only rarely cross page
+                                // bounderies.
+                                continue :pii;
+                            },
+                            else => {
+                                log.err("{}", .{err});
+                                @panic("TODO: error handling for mmap.");
+                            },
+                        };
+                        assert(@as(u64, @intFromPtr(addr.ptr)) == page_addr);
+                        // `gop.value_ptr.* = {};` not needed because it's void.
+                        log.info("mmap: {*}", .{addr.ptr});
                     }
+                    try pages_made_writable.put(arena, page_addr, {});
                 }
 
-                const flicken_addr: [*]u8 = @ptrFromInt(patch_range.getStart(u64));
-                const flicken_slice = flicken_addr[0 .. flicken.bytes.len + 5];
+                // Now the patching for the patch request can't fail anymore.
+                const flicken_addr: [*]u8 = @ptrFromInt(allocated_range.getStart(u64));
+                const flicken_slice = flicken_addr[0..flicken.size()];
 
                 const jump_to_offset: i32 = blk: {
-                    const from: i64 = @intCast(@intFromPtr(request.bytes.ptr) + jump_rel32_size);
-                    const to = patch_range.start;
+                    const from: i64 = @intCast(@intFromPtr(&request.bytes[
+                        pii.num_prefixes + jump_rel32_size
+                    ]));
+                    const to = allocated_range.start;
                     break :blk @intCast(to - from);
                 };
-                request.bytes[0] = jump_rel32;
-                mem.writeInt(i32, request.bytes[1..5], jump_to_offset, .little);
-                for (request.bytes[5..]) |*b| {
-                    b.* = int3;
-                }
+                @memset(request.bytes[0..pii.num_prefixes], nop);
+                request.bytes[pii.num_prefixes] = jump_rel32;
+                mem.writeInt(i32, request.bytes[pii.num_prefixes + 1 ..][0..4], jump_to_offset, .little);
+                // TODO: pad remaining with nops or int3
 
                 const jump_back_offset: i32 = blk: {
-                    const from = patch_range.end;
-                    const to: i64 = @intCast(@intFromPtr(request.bytes.ptr) + request.bytes.len);
+                    const from = allocated_range.end;
+                    const to: i64 = @intCast(@intFromPtr(&request.bytes[request.size]));
                     break :blk @intCast(to - from);
                 };
                 @memcpy(flicken_addr, flicken.bytes);
                 flicken_slice[flicken.bytes.len] = jump_rel32;
-                mem.writeInt(i32, flicken_slice[flicken.bytes.len + 1 ..][0..4], jump_back_offset, .little);
+                const jump_back_location = flicken_slice[flicken.bytes.len + 1 ..][0..4];
+                mem.writeInt(i32, jump_back_location, jump_back_offset, .little);
 
                 // The jumps have to be in the opposite direction.
                 assert(math.sign(jump_to_offset) * math.sign(jump_back_offset) < 0);
+                break;
             }
         }
-
         // Change pages back to R|X.
+        std.Thread.sleep(1000 * 1000 * 1000);
+        try printMaps();
         var iter = pages_made_writable.keyIterator();
         const protection = posix.PROT.READ | posix.PROT.EXEC;
         while (iter.next()) |page_addr| {
             const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr.*);
+            log.info("mprotect patch: {*}", .{ptr});
             try posix.mprotect(ptr[0..page_size], protection);
         }
 
         log.info("patchRegion: Finished applying patches", .{});
     }
+    try printMaps();
+
     // TODO: statistics
 }
+
+fn printMaps() !void {
+    const path = "/proc/self/maps";
+    var reader = try std.fs.cwd().openFile(path, .{});
+    var buffer: [1024 * 1024]u8 = undefined;
+    const size = try reader.readAll(&buffer);
+    std.debug.print("\n{s}\n", .{buffer[0..size]});
+}
+
+/// Returns a tuple of the aligned addresses of the start and end pages the given range touches.
+fn pageRange(range: Range) struct { u64, u64 } {
+    const start_page = mem.alignBackward(u64, range.getStart(u64), page_size);
+    const end_page = mem.alignForward(u64, range.getEnd(u64), page_size);
+    assert(end_page != start_page);
+    assert(end_page > start_page);
+    return .{ start_page, end_page };
+}
+
+const PatchInstructionIterator = struct {
+    bytes: []const u8, // first byte is first byte of instruction to patch.
+    instruction_size: u8,
+    flicken_size: u64,
+
+    // Internal state
+    num_prefixes: u8,
+    pli: PatchLocationIterator,
+    valid_range: Range,
+
+    fn init(
+        bytes: []const u8,
+        instruction_size: u8,
+        flicken_size: u64,
+    ) PatchInstructionIterator {
+        const patch_bytes = getPatchBytes(bytes, instruction_size, 0);
+        var pli = PatchLocationIterator.init(patch_bytes, @intFromPtr(&bytes[5]));
+        // TODO: handle null case which could only happen on negative offset
+        const valid_range = pli.next() orelse Range{ .start = 0, .end = 0 };
+        return .{
+            .bytes = bytes,
+            .instruction_size = instruction_size,
+            .flicken_size = flicken_size,
+            .num_prefixes = 0,
+            .pli = pli,
+            .valid_range = valid_range,
+        };
+    }
+
+    fn next(pii: *PatchInstructionIterator, gpa: mem.Allocator, address_allocator: *AddressAllocator) !?Range {
+        // TODO: This is basically a state machine here, so maybe use labeled switch instead for
+        // clarity
+        while (true) {
+            if (try address_allocator.allocate(
+                gpa,
+                pii.flicken_size,
+                pii.valid_range,
+            )) |allocated_range| {
+                assert(allocated_range.size() == pii.flicken_size);
+                return allocated_range;
+            }
+
+            // Valid range is used up, so get a new one from the pli.
+            if (pii.pli.next()) |valid_range| {
+                pii.valid_range = valid_range;
+                continue;
+            }
+
+            // PLI is used up, so increase the number of prefixes.
+            if (pii.num_prefixes < @min(pii.instruction_size, prefixes.len)) {
+                pii.num_prefixes += 1;
+                const patch_bytes = getPatchBytes(pii.bytes, pii.instruction_size, pii.num_prefixes);
+                pii.pli = PatchLocationIterator.init(
+                    patch_bytes,
+                    @intFromPtr(&pii.bytes[pii.num_prefixes + 5]),
+                );
+                if (pii.pli.next()) |valid_range| {
+                    pii.valid_range = valid_range;
+                    continue;
+                }
+                // If the new pli is empty immediately, we loop again to try the next prefix count.
+                continue;
+            }
+
+            // We've used up the iterator at this point.
+            return null;
+        }
+        comptime unreachable;
+    }
+
+    fn getPatchBytes(instruction_bytes: []const u8, instruction_size: u8, num_prefixes: u8) [4]PatchByte {
+        const offset_location = instruction_bytes[num_prefixes + 1 ..][0..4]; // +1 for e9
+        var patch_bytes: [4]PatchByte = undefined;
+        for (&patch_bytes, offset_location, num_prefixes + 1..) |*patch_byte, offset_byte, i| {
+            if (i < instruction_size) {
+                patch_byte.* = .free;
+            } else {
+                patch_byte.* = .{ .used = offset_byte };
+            }
+        }
+        return patch_bytes;
+    }
+};
