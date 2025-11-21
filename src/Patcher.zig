@@ -118,7 +118,7 @@ pub const PatchRequest = struct {
     ) std.Io.Writer.Error!void {
         try writer.print(
             ".{{ .address = 0x{x}, .bytes = 0x{x}, .flicken = {} }}",
-            .{ @intFromPtr(self.bytes.ptr), self.bytes, @intFromEnum(self.flicken) },
+            .{ @intFromPtr(self.bytes.ptr), self.bytes[0..self.size], @intFromEnum(self.flicken) },
         );
     }
 };
@@ -168,8 +168,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         var last_offset: ?u64 = null;
         for (patch_requests.items, 0..) |request, i| {
             if (last_offset != null and last_offset.? == request.offset) {
-                var buffer: [256]u8 = undefined;
-                const fmt = disassembler.formatBytes(request.bytes, &buffer);
+                const fmt = disassembler.formatBytes(request.bytes);
                 log.err(
                     "patchRegion: Found duplicate patch requests for instruction: {s}",
                     .{fmt},
@@ -181,11 +180,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
             last_offset = request.offset;
 
             if (@as(u64, @intFromEnum(request.flicken)) >= patcher.flicken.count()) {
-                var buffer: [256]u8 = undefined;
-                const fmt = disassembler.formatBytes(
-                    request.bytes[0..request.size],
-                    &buffer,
-                );
+                const fmt = disassembler.formatBytes(request.bytes[0..request.size]);
                 log.err(
                     "patchRegion: Usage of undefined flicken in request {f} for instruction: {s}",
                     .{ request, fmt },
@@ -216,55 +211,21 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
                 request.size,
                 flicken.size(),
             );
-            pii: while (try pii.next(patcher.gpa, &patcher.address_allocator)) |allocated_range| {
-                // Ensure `allocated_range` is mapped R|W.
-                const start, const end = pageRange(allocated_range);
-                const protection = posix.PROT.READ | posix.PROT.WRITE;
-                var page_addr = start;
-                while (page_addr < end) : (page_addr += page_size) {
-                    // If the page is already writable, skip it.
-                    if (pages_made_writable.get(page_addr)) |_| continue;
-                    // If we mapped it already we have to do mprotect, else mmap.
-                    const gop = try patcher.allocated_pages.getOrPut(patcher.gpa, page_addr);
-                    if (gop.found_existing) {
-                        const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr);
-                        try posix.mprotect(ptr[0..page_addr], protection);
-                    } else {
-                        const addr = posix.mmap(
-                            @ptrFromInt(page_addr),
-                            page_size,
-                            protection,
-                            .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = true },
-                            -1,
-                            0,
-                        ) catch |err| switch (err) {
-                            error.MappingAlreadyExists => {
-                                // If the mapping exists this means that the someone else
-                                // (executable, OS, dynamic loader,...) allocated something there.
-                                // We block this so we don't try this page again in the future,
-                                // saving a bunch of syscalls.
-                                try patcher.address_allocator.block(
-                                    patcher.gpa,
-                                    .{ .start = @intCast(page_addr), .end = @intCast(page_addr + page_size) },
-                                    page_size,
-                                );
-                                // PERF: In theory we could set a flag and do the continue outside
-                                // of this inner loop. This would make this a bit faster, since
-                                // notice a bunch of pages being allocated, instead of just one by
-                                // one. But in practice the Flicken only rarely cross page
-                                // bounderies.
-                                continue :pii;
-                            },
-                            else => {
-                                log.err("{}", .{err});
-                                @panic("TODO: error handling for mmap.");
-                            },
-                        };
-                        assert(@as(u64, @intFromPtr(addr.ptr)) == page_addr);
-                        // `gop.value_ptr.* = {};` not needed because it's void.
-                    }
-                    try pages_made_writable.put(arena, page_addr, {});
-                }
+            // TODO: There is a "Ghost Page" edge case here. If `pii.next()` returns a range that
+            // spans multiple pages (Pages A and B), we might successfully mmap Page A but fail to
+            // mmap Page B. The loop will `continue` to the next candidate range, leaving Page A
+            // mapped. While harmless (it becomes an unused executable page), it is technically a
+            // memory leak. A future fix should track "current attempt" pages separately and unmap
+            // them on failure.
+            while (try pii.next(patcher.gpa, &patcher.address_allocator)) |allocated_range| {
+                try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(allocated_range));
+                patcher.ensureRangeWritable(allocated_range, &pages_made_writable) catch |err| switch (err) {
+                    error.MappingAlreadyExists => continue,
+                    else => {
+                        log.err("{}", .{err});
+                        @panic("Unexpected Error");
+                    },
+                };
 
                 // Now the patching for the patch request can't fail anymore.
                 const flicken_addr: [*]u8 = @ptrFromInt(allocated_range.getStart(u64));
@@ -332,13 +293,60 @@ fn printMaps() !void {
     std.debug.print("\n{s}\n", .{buffer[0..size]});
 }
 
-/// Returns a tuple of the aligned addresses of the start and end pages the given range touches.
-fn pageRange(range: Range) struct { u64, u64 } {
+/// Returns the number of pages that the given range touches.
+fn touchedPageCount(range: Range) u32 {
     const start_page = mem.alignBackward(u64, range.getStart(u64), page_size);
-    const end_page = mem.alignForward(u64, range.getEnd(u64), page_size);
-    assert(end_page != start_page);
-    assert(end_page > start_page);
-    return .{ start_page, end_page };
+    // alignBackward on (end - 1) handles the exclusive upper bound correctly
+    const end_page = mem.alignBackward(u64, range.getEnd(u64) - 1, page_size);
+    return @intCast((end_page - start_page) / page_size + 1);
+}
+
+/// Ensure `range` is mapped R|W. Assumes `pages_made_writable` has enough free capacity.
+fn ensureRangeWritable(
+    patcher: *Patcher,
+    range: Range,
+    pages_made_writable: *std.AutoHashMapUnmanaged(u64, void),
+) !void {
+    const start_page = mem.alignBackward(u64, range.getStart(u64), page_size);
+    const end_page = mem.alignBackward(u64, range.getEnd(u64) - 1, page_size);
+    const protection = posix.PROT.READ | posix.PROT.WRITE;
+    var page_addr = start_page;
+    while (page_addr <= end_page) : (page_addr += page_size) {
+        // If the page is already writable, skip it.
+        if (pages_made_writable.get(page_addr)) |_| continue;
+        // If we mapped it already we have to do mprotect, else mmap.
+        const gop = try patcher.allocated_pages.getOrPut(patcher.gpa, page_addr);
+        if (gop.found_existing) {
+            const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr);
+            try posix.mprotect(ptr[0..page_addr], protection);
+        } else {
+            const addr = posix.mmap(
+                @ptrFromInt(page_addr),
+                page_size,
+                protection,
+                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = true },
+                -1,
+                0,
+            ) catch |err| switch (err) {
+                error.MappingAlreadyExists => {
+                    // If the mapping exists this means that the someone else
+                    // (executable, OS, dynamic loader,...) allocated something there.
+                    // We block this so we don't try this page again in the future,
+                    // saving a bunch of syscalls.
+                    try patcher.address_allocator.block(
+                        patcher.gpa,
+                        .{ .start = @intCast(page_addr), .end = @intCast(page_addr + page_size) },
+                        page_size,
+                    );
+                    return err;
+                },
+                else => return err,
+            };
+            assert(@as(u64, @intFromPtr(addr.ptr)) == page_addr);
+            // `gop.value_ptr.* = {};` not needed because it's void.
+        }
+        pages_made_writable.putAssumeCapacityNoClobber(page_addr, {});
+    }
 }
 
 const PatchInstructionIterator = struct {
@@ -374,42 +382,46 @@ const PatchInstructionIterator = struct {
         gpa: mem.Allocator,
         address_allocator: *AddressAllocator,
     ) !?Range {
-        // TODO: This is basically a state machine here, so maybe use labeled switch instead for
-        // clarity.
-        while (true) {
-            if (try address_allocator.allocate(
-                gpa,
-                pii.flicken_size,
-                pii.valid_range,
-            )) |allocated_range| {
-                assert(allocated_range.size() == pii.flicken_size);
-                return allocated_range;
-            }
-
-            // Valid range is used up, so get a new one from the pli.
-            if (pii.pli.next()) |valid_range| {
-                pii.valid_range = valid_range;
-                continue;
-            }
-
-            // PLI is used up, so increase the number of prefixes.
-            if (pii.num_prefixes < @min(pii.instruction_size, prefixes.len)) {
-                pii.num_prefixes += 1;
-                const patch_bytes = getPatchBytes(pii.bytes, pii.instruction_size, pii.num_prefixes);
-                pii.pli = PatchLocationIterator.init(
-                    patch_bytes,
-                    @intFromPtr(&pii.bytes[pii.num_prefixes + 5]),
-                );
+        const State = enum {
+            allocation,
+            range,
+            prefix,
+        };
+        blk: switch (State.allocation) {
+            .allocation => {
+                if (try address_allocator.allocate(
+                    gpa,
+                    pii.flicken_size,
+                    pii.valid_range,
+                )) |allocated_range| {
+                    assert(allocated_range.size() == pii.flicken_size);
+                    return allocated_range;
+                } else {
+                    continue :blk .range;
+                }
+            },
+            .range => {
+                // Valid range is used up, so get a new one from the pli.
                 if (pii.pli.next()) |valid_range| {
                     pii.valid_range = valid_range;
-                    continue;
+                    continue :blk .allocation;
+                } else {
+                    continue :blk .prefix;
                 }
-                // If the new pli is empty immediately, we loop again to try the next prefix count.
-                continue;
-            }
-
-            // We've used up the iterator at this point.
-            return null;
+            },
+            .prefix => {
+                if (pii.num_prefixes < @min(pii.instruction_size, prefixes.len)) {
+                    pii.num_prefixes += 1;
+                    const patch_bytes = getPatchBytes(pii.bytes, pii.instruction_size, pii.num_prefixes);
+                    pii.pli = PatchLocationIterator.init(
+                        patch_bytes,
+                        @intFromPtr(&pii.bytes[pii.num_prefixes + 5]),
+                    );
+                    continue :blk .range;
+                } else {
+                    return null;
+                }
+            },
         }
         comptime unreachable;
     }
