@@ -17,6 +17,7 @@ pub const std_options: std.Options = .{
         .{ .scope = .disassembler, .level = .info },
         .{ .scope = .patcher, .level = .debug },
         .{ .scope = .patch_location_iterator, .level = .warn },
+        .{ .scope = .flicker, .level = .info },
     },
 };
 const page_size = std.heap.pageSize();
@@ -173,12 +174,11 @@ fn loadStaticElf(ehdr: elf.Header, file_reader: *std.fs.File.Reader) !usize {
         hint,
         maxva - minva,
         posix.PROT.NONE,
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = !dynamic },
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = !dynamic },
         -1,
         0,
     );
     log.debug("Pre-flight reservation at: {*}, size: 0x{x}", .{ base.ptr, base.len });
-    posix.munmap(base);
 
     const flags = posix.MAP{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true };
     var phdrs = ehdr.iterateProgramHeaders(file_reader);
@@ -194,8 +194,8 @@ fn loadStaticElf(ehdr: elf.Header, file_reader: *std.fs.File.Reader) !usize {
         const base_for_dyn = if (dynamic) @intFromPtr(base.ptr) else 0;
         start += base_for_dyn;
         log.debug(
-            "  - phdr[{}]: mapping 0x{x} bytes at 0x{x} (vaddr=0x{x}, dyn_base=0x{x})",
-            .{ phdr_idx, size, start, phdr.p_vaddr, base_for_dyn },
+            "  - phdr[{}]: mapping 0x{x} - 0x{x} (vaddr=0x{x}, dyn_base=0x{x})",
+            .{ phdr_idx, start, start + size, phdr.p_vaddr, base_for_dyn },
         );
         // NOTE: We can't use a single file-backed mmap for the segment, because p_memsz may be
         // larger than p_filesz. This difference accounts for the .bss section, which must be

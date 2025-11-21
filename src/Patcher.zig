@@ -92,7 +92,6 @@ pub const FlickenId = enum(u64) {
     /// The bytes are always empty, meaning that `bytes.len == 0`.
     /// It also needs special handling when constructing the patches, because it's different for
     /// each instruction.
-    // TODO: implement the special handling
     nop = 0,
     _,
 };
@@ -144,7 +143,9 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         // Get where to patch.
         var instruction_iterator = InstructionIterator.init(region);
         while (instruction_iterator.next()) |instruction| {
-            const should_patch: bool = instruction.instruction.attributes & zydis.ZYDIS_ATTRIB_HAS_LOCK > 0;
+            // TODO: handle RIP relative instructions/operands somehow.
+            // Maybe use `ZydisCalcAbsoluteAddress`?
+            const should_patch: bool = instruction.instruction.mnemonic == zydis.ZYDIS_MNEMONIC_SYSCALL;
             if (should_patch) {
                 const offset = instruction.address - @intFromPtr(region.ptr);
                 const request: PatchRequest = .{
@@ -197,18 +198,19 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
     {
         // Apply patches.
         try posix.mprotect(region, posix.PROT.READ | posix.PROT.WRITE);
-        defer {
-            log.info("mprotect region: {*}", .{region});
-            posix.mprotect(region, posix.PROT.READ | posix.PROT.EXEC) catch
-                @panic("patchRegion: mprotect back to R|X failed. Can't continue");
-        }
+        defer posix.mprotect(region, posix.PROT.READ | posix.PROT.EXEC) catch
+            @panic("patchRegion: mprotect back to R|X failed. Can't continue");
 
         // PERF: A set of the pages for the patches/flicken we made writable. This way we don't
         // repeatedly change call `mprotect` on the same page to switch it from R|W to R|X and back.
         // At the end we `mprotect` all pages in this set back to being R|X.
         var pages_made_writable: std.AutoHashMapUnmanaged(u64, void) = .empty;
         for (patch_requests.items) |request| {
-            const flicken = patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
+            const flicken: Flicken = if (request.flicken == .nop)
+                .{ .name = "nop", .bytes = request.bytes[0..request.size] }
+            else
+                patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
+
             var pii = PatchInstructionIterator.init(
                 request.bytes,
                 request.size,
@@ -260,7 +262,6 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
                         };
                         assert(@as(u64, @intFromPtr(addr.ptr)) == page_addr);
                         // `gop.value_ptr.* = {};` not needed because it's void.
-                        log.info("mmap: {*}", .{addr.ptr});
                     }
                     try pages_made_writable.put(arena, page_addr, {});
                 }
@@ -276,44 +277,44 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
                     const to = allocated_range.start;
                     break :blk @intCast(to - from);
                 };
-                @memset(request.bytes[0..pii.num_prefixes], nop);
-                request.bytes[pii.num_prefixes] = jump_rel32;
-                mem.writeInt(i32, request.bytes[pii.num_prefixes + 1 ..][0..4], jump_to_offset, .little);
-                // TODO: pad remaining with nops or int3
-
                 const jump_back_offset: i32 = blk: {
                     const from = allocated_range.end;
                     const to: i64 = @intCast(@intFromPtr(&request.bytes[request.size]));
                     break :blk @intCast(to - from);
                 };
+                // The jumps have to be in the opposite direction.
+                assert(math.sign(jump_to_offset) * math.sign(jump_back_offset) < 0);
+
+                // Write to the trampoline first, because for the `nop` flicken `flicken.bytes`
+                // points to `request.bytes` which we overwrite in the next step.
                 @memcpy(flicken_addr, flicken.bytes);
                 flicken_slice[flicken.bytes.len] = jump_rel32;
                 const jump_back_location = flicken_slice[flicken.bytes.len + 1 ..][0..4];
                 mem.writeInt(i32, jump_back_location, jump_back_offset, .little);
 
-                // The jumps have to be in the opposite direction.
-                assert(math.sign(jump_to_offset) * math.sign(jump_back_offset) < 0);
+                @memcpy(request.bytes[0..pii.num_prefixes], prefixes[0..pii.num_prefixes]);
+                request.bytes[pii.num_prefixes] = jump_rel32;
+                mem.writeInt(i32, request.bytes[pii.num_prefixes + 1 ..][0..4], jump_to_offset, .little);
+                // TODO: pad remaining with nops or int3
+
                 break;
             }
         }
         // Change pages back to R|X.
-        std.Thread.sleep(1000 * 1000 * 1000);
-        try printMaps();
         var iter = pages_made_writable.keyIterator();
         const protection = posix.PROT.READ | posix.PROT.EXEC;
         while (iter.next()) |page_addr| {
             const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr.*);
-            log.info("mprotect patch: {*}", .{ptr});
             try posix.mprotect(ptr[0..page_size], protection);
         }
 
         log.info("patchRegion: Finished applying patches", .{});
     }
-    try printMaps();
 
     // TODO: statistics
 }
 
+/// Only used for debugging.
 fn printMaps() !void {
     const path = "/proc/self/maps";
     var reader = try std.fs.cwd().openFile(path, .{});
@@ -348,7 +349,6 @@ const PatchInstructionIterator = struct {
     ) PatchInstructionIterator {
         const patch_bytes = getPatchBytes(bytes, instruction_size, 0);
         var pli = PatchLocationIterator.init(patch_bytes, @intFromPtr(&bytes[5]));
-        // TODO: handle null case which could only happen on negative offset
         const valid_range = pli.next() orelse Range{ .start = 0, .end = 0 };
         return .{
             .bytes = bytes,
