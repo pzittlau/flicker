@@ -294,8 +294,17 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
 
                 @memcpy(request.bytes[0..pii.num_prefixes], prefixes[0..pii.num_prefixes]);
                 request.bytes[pii.num_prefixes] = jump_rel32;
-                mem.writeInt(i32, request.bytes[pii.num_prefixes + 1 ..][0..4], jump_to_offset, .little);
-                // TODO: pad remaining with nops or int3
+                mem.writeInt(
+                    i32,
+                    request.bytes[pii.num_prefixes + 1 ..][0..4],
+                    jump_to_offset,
+                    .little,
+                );
+                // Pad remaining with int3.
+                const patch_end_index = pii.num_prefixes + jump_rel32_size;
+                if (patch_end_index < request.size) {
+                    @memset(request.bytes[patch_end_index..request.size], int3);
+                }
 
                 break;
             }
@@ -360,9 +369,13 @@ const PatchInstructionIterator = struct {
         };
     }
 
-    fn next(pii: *PatchInstructionIterator, gpa: mem.Allocator, address_allocator: *AddressAllocator) !?Range {
+    fn next(
+        pii: *PatchInstructionIterator,
+        gpa: mem.Allocator,
+        address_allocator: *AddressAllocator,
+    ) !?Range {
         // TODO: This is basically a state machine here, so maybe use labeled switch instead for
-        // clarity
+        // clarity.
         while (true) {
             if (try address_allocator.allocate(
                 gpa,
