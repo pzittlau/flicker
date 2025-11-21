@@ -3,6 +3,7 @@ const mem = std.mem;
 const zydis = @import("zydis").zydis;
 
 const log = std.log.scoped(.disassembler);
+const assert = std.debug.assert;
 
 pub const InstructionIterator = struct {
     decoder: zydis.ZydisDecoder,
@@ -86,49 +87,72 @@ pub const BundledInstruction = struct {
     operands: []const zydis.ZydisDecodedOperand,
 };
 
-pub const InstructionFormatter = struct {
-    formatter: zydis.ZydisFormatter,
-
-    pub fn init() InstructionFormatter {
-        var formatter: zydis.ZydisFormatter = undefined;
-        const status = zydis.ZydisFormatterInit(&formatter, zydis.ZYDIS_FORMATTER_STYLE_ATT);
-        if (!zydis.ZYAN_SUCCESS(status)) @panic("Zydis formatter init failed");
-
-        return .{
-            .formatter = formatter,
-        };
-    }
-
-    pub fn format(
-        formatter: *const InstructionFormatter,
-        instruction: BundledInstruction,
-        buffer: []u8,
-    ) []u8 {
-        const status = zydis.ZydisFormatterFormatInstruction(
-            &formatter.formatter,
-            instruction.instruction,
-            instruction.operands.ptr,
-            instruction.instruction.operand_count_visible,
-            buffer.ptr,
-            buffer.len,
-            instruction.address,
-            null,
-        );
-        if (!zydis.ZYAN_SUCCESS(status)) {
-            @panic("wow");
-        }
-        return mem.sliceTo(buffer, 0);
-    }
-};
-
 /// Disassemble `bytes` and format them into the given buffer. Useful for error reporting or
 /// debugging purposes.
-/// This function should not be called in a tight loop as it's intentionally inefficient due tue
-/// having a simple API.
-pub fn formatBytes(bytes: []const u8, buffer: []u8) []u8 {
-    var iter = InstructionIterator.init(bytes);
+/// This function is not threadsafe.
+pub fn formatBytes(bytes: []const u8) []u8 {
+    return formatInstruction(disassembleInstruction(bytes));
+}
 
-    const instr = iter.next() orelse return buffer[0..0];
-    const formatter = InstructionFormatter.init();
-    return formatter.format(instr, buffer);
+/// Format the given instruction into the buffer.
+/// This function is not threadsafe.
+pub fn formatInstruction(instruction: BundledInstruction) []u8 {
+    // Static variable to initialize the formatter only once and have a valid address for the
+    // buffer.
+    const static = struct {
+        var initialized = false;
+        var formatter: zydis.ZydisFormatter = undefined;
+        var buffer: [256]u8 = undefined;
+    };
+    if (!static.initialized) {
+        const status = zydis.ZydisFormatterInit(&static.formatter, zydis.ZYDIS_FORMATTER_STYLE_ATT);
+        if (!zydis.ZYAN_SUCCESS(status)) @panic("Zydis formatter init failed");
+    }
+    const status = zydis.ZydisFormatterFormatInstruction(
+        &static.formatter,
+        instruction.instruction,
+        instruction.operands.ptr,
+        instruction.instruction.operand_count_visible,
+        &static.buffer,
+        static.buffer.len,
+        instruction.address,
+        null,
+    );
+    assert(zydis.ZYAN_SUCCESS(status)); // TODO: handle
+    return mem.sliceTo(&static.buffer, 0);
+}
+
+/// Disassemble the first instruction at bytes.
+/// This function is not threadsafe.
+pub fn disassembleInstruction(bytes: []const u8) BundledInstruction {
+    // Static variable to initialize the decoder only once and have a valid address for the
+    // instruction and operands.
+    const static = struct {
+        var initialized = false;
+        var decoder: zydis.ZydisDecoder = undefined;
+        var instruction: zydis.ZydisDecodedInstruction = undefined;
+        var operands: [zydis.ZYDIS_MAX_OPERAND_COUNT]zydis.ZydisDecodedOperand = undefined;
+    };
+    if (!static.initialized) {
+        const status = zydis.ZydisDecoderInit(
+            &static.decoder,
+            zydis.ZYDIS_MACHINE_MODE_LONG_64,
+            zydis.ZYDIS_STACK_WIDTH_64,
+        );
+        if (!zydis.ZYAN_SUCCESS(status)) @panic("Zydis decoder init failed");
+        static.initialized = true;
+    }
+    const status = zydis.ZydisDecoderDecodeFull(
+        &static.decoder,
+        bytes.ptr,
+        bytes.len,
+        &static.instruction,
+        &static.operands,
+    );
+    assert(zydis.ZYAN_SUCCESS(status)); // TODO: handle
+    return .{
+        .address = @intFromPtr(bytes.ptr),
+        .instruction = &static.instruction,
+        .operands = &static.operands,
+    };
 }
