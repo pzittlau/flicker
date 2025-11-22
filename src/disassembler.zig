@@ -88,13 +88,14 @@ pub const BundledInstruction = struct {
 };
 
 /// Disassemble `bytes` and format them into the given buffer. Useful for error reporting or
-/// debugging purposes.
+/// debugging purposes. On error return an empty string.
 /// This function is not threadsafe.
 pub fn formatBytes(bytes: []const u8) []u8 {
-    return formatInstruction(disassembleInstruction(bytes));
+    const instr = disassembleInstruction(bytes) orelse return "";
+    return formatInstruction(instr);
 }
 
-/// Format the given instruction into the buffer.
+/// Format the given instruction into the buffer. On error return an empty string.
 /// This function is not threadsafe.
 pub fn formatInstruction(instruction: BundledInstruction) []u8 {
     // Static variable to initialize the formatter only once and have a valid address for the
@@ -118,13 +119,16 @@ pub fn formatInstruction(instruction: BundledInstruction) []u8 {
         instruction.address,
         null,
     );
-    assert(zydis.ZYAN_SUCCESS(status)); // TODO: handle
-    return mem.sliceTo(&static.buffer, 0);
+    if (zydis.ZYAN_SUCCESS(status)) {
+        return mem.sliceTo(&static.buffer, 0);
+    } else {
+        return "";
+    }
 }
 
-/// Disassemble the first instruction at bytes.
+/// Disassemble the first instruction at bytes. On error return `null`.
 /// This function is not threadsafe.
-pub fn disassembleInstruction(bytes: []const u8) BundledInstruction {
+pub fn disassembleInstruction(bytes: []const u8) ?BundledInstruction {
     // Static variable to initialize the decoder only once and have a valid address for the
     // instruction and operands.
     const static = struct {
@@ -149,10 +153,13 @@ pub fn disassembleInstruction(bytes: []const u8) BundledInstruction {
         &static.instruction,
         &static.operands,
     );
-    assert(zydis.ZYAN_SUCCESS(status)); // TODO: handle
-    return .{
-        .address = @intFromPtr(bytes.ptr),
-        .instruction = &static.instruction,
-        .operands = &static.operands,
-    };
+    if (zydis.ZYAN_SUCCESS(status)) {
+        return .{
+            .address = @intFromPtr(bytes.ptr),
+            .instruction = &static.instruction,
+            .operands = &static.operands,
+        };
+    } else {
+        return null;
+    }
 }
