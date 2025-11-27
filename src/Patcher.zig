@@ -143,9 +143,8 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         // Get where to patch.
         var instruction_iterator = InstructionIterator.init(region);
         while (instruction_iterator.next()) |instruction| {
-            // TODO: handle RIP relative instructions/operands somehow.
-            // Maybe use `ZydisCalcAbsoluteAddress`?
-            const should_patch: bool = instruction.instruction.mnemonic == zydis.ZYDIS_MNEMONIC_SYSCALL;
+            const should_patch = instruction.instruction.attributes & zydis.ZYDIS_ATTRIB_HAS_LOCK > 0 or
+                instruction.instruction.mnemonic == zydis.ZYDIS_MNEMONIC_SYSCALL;
             if (should_patch) {
                 const offset = instruction.address - @intFromPtr(region.ptr);
                 const request: PatchRequest = .{
@@ -249,6 +248,19 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
                 // Write to the trampoline first, because for the `nop` flicken `flicken.bytes`
                 // points to `request.bytes` which we overwrite in the next step.
                 @memcpy(flicken_addr, flicken.bytes);
+                if (request.flicken == .nop) {
+                    const instr_bytes = request.bytes[0..request.size];
+                    if (disassembler.disassembleInstruction(instr_bytes)) |bundled_instr| {
+                        try relocateInstruction(
+                            bundled_instr,
+                            @intCast(allocated_range.start),
+                            flicken_slice[0..request.size],
+                        );
+                    } else {
+                        log.err("patchRegion: Failed to disassemble instruction for relocation at 0x{x}", .{request.offset});
+                        return error.DisassemblyFailed;
+                    }
+                }
                 flicken_slice[flicken.bytes.len] = jump_rel32;
                 const jump_back_location = flicken_slice[flicken.bytes.len + 1 ..][0..4];
                 mem.writeInt(i32, jump_back_location, jump_back_offset, .little);
@@ -439,3 +451,72 @@ const PatchInstructionIterator = struct {
         return patch_bytes;
     }
 };
+
+/// Fixes RIP-relative operands in an instruction that has been moved to a new address.
+fn relocateInstruction(
+    instruction: disassembler.BundledInstruction,
+    trampoline_addr: u64,
+    buffer: []u8,
+) !void {
+    const instr = instruction.instruction;
+    // Iterate all operands
+    var i: u8 = 0;
+    while (i < instr.operand_count) : (i += 1) {
+        const operand = &instruction.operands[i];
+        var result_address: u64 = 0;
+
+        // Check for RIP-relative memory operand
+        const is_rip_rel = operand.type == zydis.ZYDIS_OPERAND_TYPE_MEMORY and
+            operand.unnamed_0.mem.base == zydis.ZYDIS_REGISTER_RIP;
+
+        // Check for relative immediate (e.g. JMP rel32)
+        const is_rel_imm = operand.type == zydis.ZYDIS_OPERAND_TYPE_IMMEDIATE and
+            operand.unnamed_0.imm.is_relative == zydis.ZYAN_TRUE;
+
+        if (is_rip_rel or is_rel_imm) {
+            const status = zydis.ZydisCalcAbsoluteAddress(
+                instr,
+                operand,
+                instruction.address,
+                &result_address,
+            );
+            if (!zydis.ZYAN_SUCCESS(status)) {
+                return error.RelocationFailed;
+            }
+
+            const next_rip = trampoline_addr + instr.length;
+            // new_disp = target - next_rip
+            const new_disp_i64: i64 = @as(i64, @intCast(result_address)) - @as(i64, @intCast(next_rip));
+
+            // Check if it fits in i32
+            if (new_disp_i64 > math.maxInt(i32) or new_disp_i64 < math.minInt(i32)) {
+                // TODO: Handle relocation overflow (e.g. by expanding instruction or failing gracefully)
+                return error.RelocationOverflow;
+            }
+            const new_disp: i32 = @intCast(new_disp_i64);
+
+            var offset: u16 = 0;
+            if (is_rip_rel) {
+                // For RIP-relative, the displacement is stored in raw.disp
+                offset = instr.raw.disp.offset;
+            } else {
+                // For relative immediate, find the matching raw immediate
+                var found = false;
+                for (&instr.raw.imm) |*imm| {
+                    if (imm.is_relative == zydis.ZYAN_TRUE) {
+                        offset = imm.offset;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return error.RelocationFailed;
+            }
+
+            if (offset == 0 or offset + 4 > buffer.len) {
+                return error.RelocationFailed;
+            }
+
+            mem.writeInt(i32, buffer[offset..][0..4], new_disp, .little);
+        }
+    }
+}
