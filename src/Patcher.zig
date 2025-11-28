@@ -123,6 +123,45 @@ pub const PatchRequest = struct {
     }
 };
 
+pub const Statistics = struct {
+    /// Direct jumps
+    jump: u64,
+    /// Punning - index represents number of prefixes used
+    punning: [4]u64,
+    /// Successor Eviction
+    successor_eviction: u64,
+    /// Neighbor Eviction
+    neighbor_eviction: u64,
+    /// Failed to patch
+    failed: u64,
+
+    pub const empty = mem.zeroes(Statistics);
+
+    pub fn punningSum(statistics: *const Statistics) u64 {
+        return statistics.punning[0] + statistics.punning[1] +
+            statistics.punning[2] + statistics.punning[3];
+    }
+
+    pub fn successful(statistics: *const Statistics) u64 {
+        return statistics.jump + statistics.punningSum() +
+            statistics.successor_eviction + statistics.neighbor_eviction;
+    }
+
+    pub fn total(statistics: *const Statistics) u64 {
+        return statistics.successful() + statistics.failed;
+    }
+
+    pub fn add(self: *Statistics, other: *const Statistics) void {
+        self.jump += other.jump;
+        for (0..self.punning.len) |i| {
+            self.punning[i] += other.punning[i];
+        }
+        self.successor_eviction += other.successor_eviction;
+        self.neighbor_eviction += other.neighbor_eviction;
+        self.failed += other.failed;
+    }
+};
+
 pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
     {
         // Block the region, such that we don't try to allocate there anymore.
@@ -137,6 +176,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
     var arena_impl = std.heap.ArenaAllocator.init(patcher.gpa);
     const arena = arena_impl.allocator();
     defer arena_impl.deinit();
+
     var patch_requests: std.ArrayListUnmanaged(PatchRequest) = .empty;
 
     {
@@ -195,6 +235,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         defer posix.mprotect(region, posix.PROT.READ | posix.PROT.EXEC) catch
             @panic("patchRegion: mprotect back to R|X failed. Can't continue");
 
+        var stats = Statistics.empty;
         // PERF: A set of the pages for the patches/flicken we made writable. This way we don't
         // repeatedly change call `mprotect` on the same page to switch it from R|W to R|X and back.
         // At the end we `mprotect` all pages in this set back to being R|X.
@@ -279,7 +320,15 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
                     @memset(request.bytes[patch_end_index..request.size], int3);
                 }
 
+                if (request.size >= 5) {
+                    assert(pii.num_prefixes == 0);
+                    stats.jump += 1;
+                } else {
+                    stats.punning[pii.num_prefixes] += 1;
+                }
                 break;
+            } else {
+                stats.failed += 1;
             }
         }
         // Change pages back to R|X.
@@ -290,10 +339,13 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
             try posix.mprotect(ptr[0..page_size], protection);
         }
 
+        log.info("{}", .{stats});
+        log.info("{}", .{stats.successful()});
+        log.info("{}", .{stats.total()});
         log.info("patchRegion: Finished applying patches", .{});
     }
+}
 
-    // TODO: statistics
 }
 
 /// Only used for debugging.
