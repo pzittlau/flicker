@@ -131,7 +131,18 @@ pub fn allocate(
     size: u64,
     valid_range: Range,
 ) !?Range {
-    log.debug("allocate: Allocating size {} in range {f}", .{ size, valid_range });
+    const range = address_allocator.findAllocation(size, valid_range) orelse return null;
+    try address_allocator.block(gpa, range, 0);
+    return range;
+}
+
+/// Find a free `Range` of size `size` within `valid_range` without blocking it.
+pub fn findAllocation(
+    address_allocator: *AddressAllocator,
+    size: u64,
+    valid_range: Range,
+) ?Range {
+    log.debug("findAllocation: Allocating size {} in range {f}", .{ size, valid_range });
     if (valid_range.size() < size) return null;
     if (size == 0) return null;
     const size_i: i64 = @intCast(size);
@@ -142,7 +153,7 @@ pub fn allocate(
     var candidate_start = valid_range.start;
     for (address_allocator.ranges.items) |reserved| {
         if (candidate_start >= valid_range.end) {
-            log.debug("allocate: Searched past the valid range.", .{});
+            log.debug("findAllocation: Searched past the valid range.", .{});
             break;
         }
 
@@ -155,9 +166,7 @@ pub fn allocate(
                     .start = candidate_start,
                     .end = candidate_start + size_i,
                 };
-                try address_allocator.block(gpa, new_range, 0);
-                assert(valid_range.contains(new_range));
-                log.debug("allocate: Found free gap: {f}", .{new_range});
+                log.debug("findAllocation: Found free gap: {f}", .{new_range});
                 return new_range;
             }
         }
@@ -173,13 +182,11 @@ pub fn allocate(
             .start = candidate_start,
             .end = candidate_start + size_i,
         };
-        try address_allocator.block(gpa, new_range, 0);
-        assert(valid_range.contains(new_range));
-        log.debug("allocate: Found free gap at end: {f}", .{new_range});
+        log.debug("findAllocation: Found free gap at end: {f}", .{new_range});
         return new_range;
     }
 
-    log.debug("allocate: No suitable gap found.", .{});
+    log.debug("findAllocation: No suitable gap found.", .{});
     return null;
 }
 
