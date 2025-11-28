@@ -537,7 +537,7 @@ fn relocateInstruction(
         // Check for relative immediate (e.g. JMP rel32)
         const is_rel_imm = operand.type == zydis.ZYDIS_OPERAND_TYPE_IMMEDIATE and
             operand.unnamed_0.imm.is_relative == zydis.ZYAN_TRUE;
-        if (!is_rip_rel and !is_rel_imm) return;
+        if (!is_rip_rel and !is_rel_imm) continue;
 
         // We have to apply a relocation
         const status = zydis.ZydisCalcAbsoluteAddress(
