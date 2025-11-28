@@ -236,11 +236,18 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
             @panic("patchRegion: mprotect back to R|X failed. Can't continue");
 
         var stats = Statistics.empty;
+        // Used to track which bytes have been modified or used for constraints (punning),
+        // to prevent future patches (from neighbor/successor eviction) from corrupting them.
+        var locked_bytes = try std.DynamicBitSetUnmanaged.initEmpty(arena, region.len);
         // PERF: A set of the pages for the patches/flicken we made writable. This way we don't
         // repeatedly change call `mprotect` on the same page to switch it from R|W to R|X and back.
         // At the end we `mprotect` all pages in this set back to being R|X.
         var pages_made_writable: std.AutoHashMapUnmanaged(u64, void) = .empty;
         for (patch_requests.items) |request| {
+            for (0..request.size) |i| {
+                assert(!locked_bytes.isSet(request.offset + i));
+            }
+
             const flicken: Flicken = if (request.flicken == .nop)
                 .{ .name = "nop", .bytes = request.bytes[0..request.size] }
             else
@@ -269,6 +276,9 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
 
                 applyPatch(request, flicken, allocated_range, pii.num_prefixes);
 
+                locked_bytes.setRangeValue(
+                    .{ .start = request.offset, .end = request.offset + request.size },
+                    true,
                 );
 
                 if (request.size >= 5) {
