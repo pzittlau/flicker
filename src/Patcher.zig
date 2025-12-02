@@ -243,176 +243,22 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         // repeatedly change call `mprotect` on the same page to switch it from R|W to R|X and back.
         // At the end we `mprotect` all pages in this set back to being R|X.
         var pages_made_writable: std.AutoHashMapUnmanaged(u64, void) = .empty;
+
         requests: for (patch_requests.items) |request| {
             for (0..request.size) |i| {
-                assert(!locked_bytes.isSet(request.offset + i));
-            }
-
-            const flicken: Flicken = if (request.flicken == .nop)
-                .{ .name = "nop", .bytes = request.bytes[0..request.size] }
-            else
-                patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
-
-            {
-                // Trying with jump or punnning first.
-                var pii = PatchInstructionIterator.init(
-                    request.bytes,
-                    request.size,
-                    flicken.size(),
-                );
-                // TODO: There is a "Ghost Page" edge case here. If `pii.next()` returns a range that
-                // spans multiple pages (Pages A and B), we might successfully mmap Page A but fail to
-                // mmap Page B. The loop will `continue` to the next candidate range, leaving Page A
-                // mapped. While harmless (it becomes an unused executable page), it is technically a
-                // memory leak. A future fix should track "current attempt" pages separately and unmap
-                // them on failure.
-                pii: while (pii.next(&patcher.address_allocator)) |allocated_range| {
-                    try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(allocated_range));
-                    patcher.ensureRangeWritable(
-                        allocated_range,
-                        &pages_made_writable,
-                    ) catch |err| switch (err) {
-                        error.MappingAlreadyExists => continue :pii,
-                        else => {
-                            log.err("{}", .{err});
-                            @panic("Unexpected Error");
-                        },
-                    };
-
-                    applyPatch(
-                        request,
-                        flicken,
-                        allocated_range,
-                        pii.num_prefixes,
-                    ) catch |err| switch (err) {
-                        error.RelocationOverflow => continue :pii,
-                        else => return err,
-                    };
-
-                    try patcher.address_allocator.block(patcher.gpa, allocated_range, 0);
-                    const lock_size = jump_rel32_size + pii.num_prefixes;
-                    locked_bytes.setRangeValue(
-                        .{ .start = request.offset, .end = request.offset + lock_size },
-                        true,
-                    );
-
-                    if (request.size >= 5) {
-                        assert(pii.num_prefixes == 0);
-                        stats.jump += 1;
-                    } else {
-                        stats.punning[pii.num_prefixes] += 1;
-                    }
+                if (locked_bytes.isSet(request.offset + i)) {
+                    log.warn("patchRegion: Skipping request at offset 0x{x} because it is locked", .{request.offset});
+                    stats.failed += 1;
                     continue :requests;
                 }
             }
 
-            {
-                // Successor eviction.
+            if (try patcher.attemptDirectOrPunning(request, arena, &locked_bytes, &pages_made_writable, &stats)) {
+                continue :requests;
+            }
 
-                // Disassemble Successor and create request and flicken for it.
-                const succ_instr = dis.disassembleInstruction(request.bytes[request.size..]) orelse @panic("can't disassemble"); // TODO: don't panic
-                const succ_request = PatchRequest{
-                    .flicken = .nop,
-                    .size = succ_instr.instruction.length,
-                    .bytes = request.bytes[request.size..],
-                    .offset = request.offset + request.size,
-                };
-                const succ_flicken = Flicken{
-                    .name = "nop",
-                    .bytes = succ_request.bytes[0..succ_request.size],
-                };
-
-                for (0..succ_request.size) |i| {
-                    if (locked_bytes.isSet(succ_request.offset + i)) @panic("locked"); // TODO: don't panic
-                }
-                // Save original bytes for reverting the change.
-                var succ_orig_bytes: [15]u8 = undefined;
-                @memcpy(
-                    succ_orig_bytes[0..succ_request.size],
-                    succ_request.bytes[0..succ_request.size],
-                );
-
-                var succ_pii = PatchInstructionIterator.init(
-                    succ_request.bytes,
-                    succ_request.size,
-                    succ_flicken.size(),
-                );
-                successor: while (succ_pii.next(&patcher.address_allocator)) |succ_range| {
-                    assert(mem.eql(
-                        u8,
-                        succ_request.bytes[0..succ_request.size],
-                        succ_orig_bytes[0..succ_request.size],
-                    ));
-
-                    try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(succ_range));
-                    patcher.ensureRangeWritable(
-                        succ_range,
-                        &pages_made_writable,
-                    ) catch |err| switch (err) {
-                        error.MappingAlreadyExists => continue :successor,
-                        else => {
-                            log.err("{}", .{err});
-                            @panic("Unexpected Error");
-                        },
-                    };
-
-                    applyPatch(
-                        succ_request,
-                        succ_flicken,
-                        succ_range,
-                        succ_pii.num_prefixes,
-                    ) catch |err| switch (err) {
-                        error.RelocationOverflow => continue :successor,
-                        else => return err,
-                    };
-
-                    // Now that the successor is patched, we can create a new PII for the original
-                    // request.
-                    var orig_pii = PatchInstructionIterator.init(
-                        request.bytes,
-                        request.size,
-                        flicken.size(),
-                    );
-                    original: while (orig_pii.next(&patcher.address_allocator)) |orig_range| {
-                        try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(orig_range));
-                        patcher.ensureRangeWritable(
-                            orig_range,
-                            &pages_made_writable,
-                        ) catch |err| switch (err) {
-                            error.MappingAlreadyExists => continue :original,
-                            else => {
-                                log.err("{}", .{err});
-                                @panic("Unexpected Error");
-                            },
-                        };
-
-                        applyPatch(
-                            request,
-                            flicken,
-                            orig_range,
-                            orig_pii.num_prefixes,
-                        ) catch |err| switch (err) {
-                            error.RelocationOverflow => continue :original,
-                            else => return err,
-                        };
-
-                        try patcher.address_allocator.block(patcher.gpa, succ_range, 0);
-                        try patcher.address_allocator.block(patcher.gpa, orig_range, 0);
-                        const lock_size = request.size + jump_rel32_size + succ_pii.num_prefixes;
-                        locked_bytes.setRangeValue(
-                            .{ .start = request.offset, .end = request.offset + lock_size },
-                            true,
-                        );
-                        stats.successor_eviction += 1;
-                        continue :requests;
-                    }
-
-                    // We couldn't patch with the bytes. So revert to original ones.
-                    @memcpy(
-                        succ_request.bytes[0..succ_request.size],
-                        succ_orig_bytes[0..succ_request.size],
-                    );
-                }
+            if (try patcher.attemptSuccessorEviction(request, arena, &locked_bytes, &pages_made_writable, &stats)) {
+                continue :requests;
             }
 
             stats.failed += 1;
@@ -431,6 +277,183 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         log.info("patched: {}/{}", .{ stats.successful(), stats.total() });
         log.info("patchRegion: Finished applying patches", .{});
     }
+}
+
+fn attemptDirectOrPunning(
+    patcher: *Patcher,
+    request: PatchRequest,
+    arena: mem.Allocator,
+    locked_bytes: *std.DynamicBitSetUnmanaged,
+    pages_made_writable: *std.AutoHashMapUnmanaged(u64, void),
+    stats: *Statistics,
+) !bool {
+    const flicken: Flicken = if (request.flicken == .nop)
+        .{ .name = "nop", .bytes = request.bytes[0..request.size] }
+    else
+        patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
+
+    var pii = PatchInstructionIterator.init(
+        request.bytes,
+        request.size,
+        flicken.size(),
+    );
+    // TODO: There is a "Ghost Page" edge case here. If `pii.next()` returns a range that
+    // spans multiple pages (Pages A and B), we might successfully mmap Page A but fail to
+    // mmap Page B. The loop will `continue` to the next candidate range, leaving Page A
+    // mapped. While harmless (it becomes an unused executable page), it is technically a
+    // memory leak. A future fix should track "current attempt" pages separately and unmap
+    // them on failure.
+    while (pii.next(&patcher.address_allocator)) |allocated_range| {
+        try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(allocated_range));
+        patcher.ensureRangeWritable(
+            allocated_range,
+            pages_made_writable,
+        ) catch |err| switch (err) {
+            error.MappingAlreadyExists => continue,
+            else => return err,
+        };
+
+        applyPatch(
+            request,
+            flicken,
+            allocated_range,
+            pii.num_prefixes,
+        ) catch |err| switch (err) {
+            error.RelocationOverflow => continue,
+            else => return err,
+        };
+
+        try patcher.address_allocator.block(patcher.gpa, allocated_range, 0);
+        const lock_size = jump_rel32_size + pii.num_prefixes;
+        locked_bytes.setRangeValue(
+            .{ .start = request.offset, .end = request.offset + lock_size },
+            true,
+        );
+
+        if (request.size >= 5) {
+            assert(pii.num_prefixes == 0);
+            stats.jump += 1;
+        } else {
+            stats.punning[pii.num_prefixes] += 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+fn attemptSuccessorEviction(
+    patcher: *Patcher,
+    request: PatchRequest,
+    arena: mem.Allocator,
+    locked_bytes: *std.DynamicBitSetUnmanaged,
+    pages_made_writable: *std.AutoHashMapUnmanaged(u64, void),
+    stats: *Statistics,
+) !bool {
+    // Disassemble Successor and create request and flicken for it.
+    const succ_instr = dis.disassembleInstruction(request.bytes[request.size..]) orelse return false;
+    const succ_request = PatchRequest{
+        .flicken = .nop,
+        .size = succ_instr.instruction.length,
+        .bytes = request.bytes[request.size..],
+        .offset = request.offset + request.size,
+    };
+    const succ_flicken = Flicken{
+        .name = "nop",
+        .bytes = succ_request.bytes[0..succ_request.size],
+    };
+
+    for (0..succ_request.size) |i| {
+        if (locked_bytes.isSet(succ_request.offset + i)) return false;
+    }
+
+    // Save original bytes for reverting the change.
+    var succ_orig_bytes: [15]u8 = undefined;
+    @memcpy(
+        succ_orig_bytes[0..succ_request.size],
+        succ_request.bytes[0..succ_request.size],
+    );
+
+    var succ_pii = PatchInstructionIterator.init(
+        succ_request.bytes,
+        succ_request.size,
+        succ_flicken.size(),
+    );
+    while (succ_pii.next(&patcher.address_allocator)) |succ_range| {
+        // Ensure bytes match original before retry.
+        assert(mem.eql(
+            u8,
+            succ_request.bytes[0..succ_request.size],
+            succ_orig_bytes[0..succ_request.size],
+        ));
+
+        try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(succ_range));
+        patcher.ensureRangeWritable(
+            succ_range,
+            pages_made_writable,
+        ) catch |err| switch (err) {
+            error.MappingAlreadyExists => continue,
+            else => return err,
+        };
+
+        applyPatch(
+            succ_request,
+            succ_flicken,
+            succ_range,
+            succ_pii.num_prefixes,
+        ) catch |err| switch (err) {
+            error.RelocationOverflow => continue,
+            else => return err,
+        };
+
+        // Now that the successor is patched, we can patch the original request.
+        const flicken: Flicken = if (request.flicken == .nop)
+            .{ .name = "nop", .bytes = request.bytes[0..request.size] }
+        else
+            patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
+
+        var orig_pii = PatchInstructionIterator.init(
+            request.bytes,
+            request.size,
+            flicken.size(),
+        );
+        while (orig_pii.next(&patcher.address_allocator)) |orig_range| {
+            try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(orig_range));
+            patcher.ensureRangeWritable(
+                orig_range,
+                pages_made_writable,
+            ) catch |err| switch (err) {
+                error.MappingAlreadyExists => continue,
+                else => return err,
+            };
+
+            applyPatch(
+                request,
+                flicken,
+                orig_range,
+                orig_pii.num_prefixes,
+            ) catch |err| switch (err) {
+                error.RelocationOverflow => continue,
+                else => return err,
+            };
+
+            try patcher.address_allocator.block(patcher.gpa, succ_range, 0);
+            try patcher.address_allocator.block(patcher.gpa, orig_range, 0);
+            const lock_size = request.size + jump_rel32_size + succ_pii.num_prefixes;
+            locked_bytes.setRangeValue(
+                .{ .start = request.offset, .end = request.offset + lock_size },
+                true,
+            );
+            stats.successor_eviction += 1;
+            return true;
+        }
+
+        // We couldn't patch with the bytes. So revert to original ones.
+        @memcpy(
+            succ_request.bytes[0..succ_request.size],
+            succ_orig_bytes[0..succ_request.size],
+        );
+    }
+    return false;
 }
 
 fn applyPatch(
