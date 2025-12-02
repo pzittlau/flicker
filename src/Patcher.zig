@@ -485,9 +485,9 @@ fn applyPatch(
     @memcpy(flicken_addr, flicken.bytes);
     if (request.flicken == .nop) {
         const instr_bytes = request.bytes[0..request.size];
-        const instr = dis.disassembleInstruction(instr_bytes);
+        const instr = dis.disassembleInstruction(instr_bytes).?;
         try relocateInstruction(
-            instr.?,
+            instr,
             @intCast(allocated_range.start),
             flicken_slice[0..request.size],
         );
@@ -676,10 +676,8 @@ fn relocateInstruction(
 ) !void {
     const instr = instruction.instruction;
     // Iterate all operands
-    var i: u8 = 0;
-    while (i < instr.operand_count) : (i += 1) {
+    for (0..instr.operand_count) |i| {
         const operand = &instruction.operands[i];
-        var result_address: u64 = 0;
 
         // Check for RIP-relative memory operand
         const is_rip_rel = operand.type == zydis.ZYDIS_OPERAND_TYPE_MEMORY and
@@ -690,34 +688,34 @@ fn relocateInstruction(
         if (!is_rip_rel and !is_rel_imm) continue;
 
         // We have to apply a relocation
+        var result_address: u64 = 0;
         const status = zydis.ZydisCalcAbsoluteAddress(
             instr,
             operand,
             instruction.address,
             &result_address,
         );
-        assert(zydis.ZYAN_SUCCESS(status)); // TODO: maybe return an error insteadt
+        assert(zydis.ZYAN_SUCCESS(status)); // TODO: maybe return an error instead
 
-        const new_disp: i32 = blk: {
-            const next_rip: i64 = @intCast(address + instr.length);
-            const new_disp = @as(i64, @intCast(result_address)) - next_rip;
-            if (new_disp > math.maxInt(i32) or new_disp < math.minInt(i32)) {
-                return error.RelocationOverflow;
-            }
-            break :blk @intCast(new_disp);
-        };
+        // Calculate new displacement relative to the new address
+        // The instruction length remains the same.
+        const next_rip: i64 = @intCast(address + instr.length);
+        const new_disp = @as(i64, @intCast(result_address)) - next_rip;
 
         var offset: u16 = 0;
+        var size_bits: u8 = 0;
+
         if (is_rip_rel) {
             offset = instr.raw.disp.offset;
+            size_bits = instr.raw.disp.size;
         } else {
             assert(is_rel_imm);
-            // For relative immediate, find the matching raw immediate. This loop works because
-            // x86-64 instructions can have at most one *relative* immediate (branch target).
+            // For relative immediate, find the matching raw immediate.
             var found = false;
             for (&instr.raw.imm) |*imm| {
                 if (imm.is_relative == zydis.ZYAN_TRUE) {
                     offset = imm.offset;
+                    size_bits = imm.size;
                     found = true;
                     break;
                 }
@@ -726,7 +724,32 @@ fn relocateInstruction(
         }
 
         assert(offset != 0);
-        assert(offset + 4 <= buffer.len);
-        mem.writeInt(i32, buffer[offset..][0..4], new_disp, .little);
+        assert(size_bits != 0);
+        const size_bytes = size_bits / 8;
+
+        if (offset + size_bytes > buffer.len) {
+            return error.RelocationFail;
+        }
+
+        const fits = switch (size_bits) {
+            8 => new_disp >= math.minInt(i8) and new_disp <= math.maxInt(i8),
+            16 => new_disp >= math.minInt(i16) and new_disp <= math.maxInt(i16),
+            32 => new_disp >= math.minInt(i32) and new_disp <= math.maxInt(i32),
+            64 => true,
+            else => unreachable,
+        };
+
+        if (!fits) {
+            return error.RelocationOverflow;
+        }
+
+        const ptr = buffer[offset..];
+        switch (size_bits) {
+            8 => ptr[0] = @as(u8, @bitCast(@as(i8, @intCast(new_disp)))),
+            16 => mem.writeInt(u16, ptr[0..2], @bitCast(@as(i16, @intCast(new_disp))), .little),
+            32 => mem.writeInt(u32, ptr[0..4], @bitCast(@as(i32, @intCast(new_disp))), .little),
+            64 => mem.writeInt(u64, ptr[0..8], @bitCast(@as(i64, @intCast(new_disp))), .little),
+            else => unreachable,
+        }
     }
 }
