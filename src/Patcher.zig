@@ -178,15 +178,24 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
     defer arena_impl.deinit();
 
     var patch_requests: std.ArrayListUnmanaged(PatchRequest) = .empty;
+    // We save the bytes where instructions start to be able to disassemble them on the fly. This is
+    // necessary for the neighbor eviction, since we can't just iterate forwards from a target
+    // instruction and disassemble happily. This is because some bytes may already be the patched
+    // ones which means that we might disassemble garbage or something different that wasn't there
+    // before. This means that we would need to stop disassembling on the first byte that is locked,
+    // which kind of defeats the purpose of neighbor eviction.
+    var instruction_starts = try std.DynamicBitSetUnmanaged.initEmpty(arena, region.len);
 
     {
         // Get where to patch.
         var instruction_iterator = InstructionIterator.init(region);
         while (instruction_iterator.next()) |instruction| {
-            const should_patch = instruction.instruction.attributes & zydis.ZYDIS_ATTRIB_HAS_LOCK > 0 or
-                instruction.instruction.mnemonic == zydis.ZYDIS_MNEMONIC_SYSCALL;
+            const offset = instruction.address - @intFromPtr(region.ptr);
+            instruction_starts.set(offset);
+
+            const should_patch = instruction.instruction.mnemonic == zydis.ZYDIS_MNEMONIC_SYSCALL or
+                instruction.instruction.attributes & zydis.ZYDIS_ATTRIB_HAS_LOCK > 0;
             if (should_patch) {
-                const offset = instruction.address - @intFromPtr(region.ptr);
                 const request: PatchRequest = .{
                     .flicken = .nop,
                     .offset = offset,
