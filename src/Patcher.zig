@@ -5,12 +5,12 @@ const math = std.math;
 const mem = std.mem;
 const posix = std.posix;
 const zydis = @import("zydis").zydis;
-const disassembler = @import("disassembler.zig");
+const dis = @import("disassembler.zig");
 
 const log = std.log.scoped(.patcher);
 const AddressAllocator = @import("AddressAllocator.zig");
-const InstructionFormatter = disassembler.InstructionFormatter;
-const InstructionIterator = disassembler.InstructionIterator;
+const InstructionFormatter = dis.InstructionFormatter;
+const InstructionIterator = dis.InstructionIterator;
 const PatchLocationIterator = @import("PatchLocationIterator.zig");
 const PatchByte = PatchLocationIterator.PatchByte;
 const Range = @import("Range.zig");
@@ -105,7 +105,7 @@ pub const PatchRequest = struct {
     /// Number of bytes of instruction.
     size: u8,
     /// A byte slice from the start of the offset to the end of the region. This isn't necessary to
-    /// have but makes this more accessible.
+    /// have but makes things more accessible.
     bytes: []u8,
 
     pub fn desc(_: void, lhs: PatchRequest, rhs: PatchRequest) bool {
@@ -207,7 +207,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         var last_offset: ?u64 = null;
         for (patch_requests.items, 0..) |request, i| {
             if (last_offset != null and last_offset.? == request.offset) {
-                const fmt = disassembler.formatBytes(request.bytes);
+                const fmt = dis.formatBytes(request.bytes);
                 log.err(
                     "patchRegion: Found duplicate patch requests for instruction: {s}",
                     .{fmt},
@@ -219,7 +219,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
             last_offset = request.offset;
 
             if (@as(u64, @intFromEnum(request.flicken)) >= patcher.flicken.count()) {
-                const fmt = disassembler.formatBytes(request.bytes[0..request.size]);
+                const fmt = dis.formatBytes(request.bytes[0..request.size]);
                 log.err(
                     "patchRegion: Usage of undefined flicken in request {f} for instruction: {s}",
                     .{ request, fmt },
@@ -243,7 +243,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
         // repeatedly change call `mprotect` on the same page to switch it from R|W to R|X and back.
         // At the end we `mprotect` all pages in this set back to being R|X.
         var pages_made_writable: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        for (patch_requests.items) |request| {
+        requests: for (patch_requests.items) |request| {
             for (0..request.size) |i| {
                 assert(!locked_bytes.isSet(request.offset + i));
             }
@@ -253,45 +253,171 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
             else
                 patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
 
-            var pii = PatchInstructionIterator.init(
-                request.bytes,
-                request.size,
-                flicken.size(),
-            );
-            // TODO: There is a "Ghost Page" edge case here. If `pii.next()` returns a range that
-            // spans multiple pages (Pages A and B), we might successfully mmap Page A but fail to
-            // mmap Page B. The loop will `continue` to the next candidate range, leaving Page A
-            // mapped. While harmless (it becomes an unused executable page), it is technically a
-            // memory leak. A future fix should track "current attempt" pages separately and unmap
-            // them on failure.
-            while (try pii.next(patcher.gpa, &patcher.address_allocator)) |allocated_range| {
-                try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(allocated_range));
-                patcher.ensureRangeWritable(allocated_range, &pages_made_writable) catch |err| switch (err) {
-                    error.MappingAlreadyExists => continue,
-                    else => {
-                        log.err("{}", .{err});
-                        @panic("Unexpected Error");
-                    },
+            {
+                // Trying with jump or punnning first.
+                var pii = PatchInstructionIterator.init(
+                    request.bytes,
+                    request.size,
+                    flicken.size(),
+                );
+                // TODO: There is a "Ghost Page" edge case here. If `pii.next()` returns a range that
+                // spans multiple pages (Pages A and B), we might successfully mmap Page A but fail to
+                // mmap Page B. The loop will `continue` to the next candidate range, leaving Page A
+                // mapped. While harmless (it becomes an unused executable page), it is technically a
+                // memory leak. A future fix should track "current attempt" pages separately and unmap
+                // them on failure.
+                pii: while (pii.next(&patcher.address_allocator)) |allocated_range| {
+                    try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(allocated_range));
+                    patcher.ensureRangeWritable(
+                        allocated_range,
+                        &pages_made_writable,
+                    ) catch |err| switch (err) {
+                        error.MappingAlreadyExists => continue :pii,
+                        else => {
+                            log.err("{}", .{err});
+                            @panic("Unexpected Error");
+                        },
+                    };
+
+                    applyPatch(
+                        request,
+                        flicken,
+                        allocated_range,
+                        pii.num_prefixes,
+                    ) catch |err| switch (err) {
+                        error.RelocationOverflow => continue :pii,
+                        else => return err,
+                    };
+
+                    try patcher.address_allocator.block(patcher.gpa, allocated_range, 0);
+                    const lock_size = jump_rel32_size + pii.num_prefixes;
+                    locked_bytes.setRangeValue(
+                        .{ .start = request.offset, .end = request.offset + lock_size },
+                        true,
+                    );
+
+                    if (request.size >= 5) {
+                        assert(pii.num_prefixes == 0);
+                        stats.jump += 1;
+                    } else {
+                        stats.punning[pii.num_prefixes] += 1;
+                    }
+                    continue :requests;
+                }
+            }
+
+            {
+                // Successor eviction.
+
+                // Disassemble Successor and create request and flicken for it.
+                const succ_instr = dis.disassembleInstruction(request.bytes[request.size..]) orelse @panic("can't disassemble"); // TODO: don't panic
+                const succ_request = PatchRequest{
+                    .flicken = .nop,
+                    .size = succ_instr.instruction.length,
+                    .bytes = request.bytes[request.size..],
+                    .offset = request.offset + request.size,
+                };
+                const succ_flicken = Flicken{
+                    .name = "nop",
+                    .bytes = succ_request.bytes[0..succ_request.size],
                 };
 
-                applyPatch(request, flicken, allocated_range, pii.num_prefixes);
-
-                locked_bytes.setRangeValue(
-                    .{ .start = request.offset, .end = request.offset + request.size },
-                    true,
+                for (0..succ_request.size) |i| {
+                    if (locked_bytes.isSet(succ_request.offset + i)) @panic("locked"); // TODO: don't panic
+                }
+                // Save original bytes for reverting the change.
+                var succ_orig_bytes: [15]u8 = undefined;
+                @memcpy(
+                    succ_orig_bytes[0..succ_request.size],
+                    succ_request.bytes[0..succ_request.size],
                 );
 
-                if (request.size >= 5) {
-                    assert(pii.num_prefixes == 0);
-                    stats.jump += 1;
-                } else {
-                    stats.punning[pii.num_prefixes] += 1;
+                var succ_pii = PatchInstructionIterator.init(
+                    succ_request.bytes,
+                    succ_request.size,
+                    succ_flicken.size(),
+                );
+                successor: while (succ_pii.next(&patcher.address_allocator)) |succ_range| {
+                    assert(mem.eql(
+                        u8,
+                        succ_request.bytes[0..succ_request.size],
+                        succ_orig_bytes[0..succ_request.size],
+                    ));
+
+                    try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(succ_range));
+                    patcher.ensureRangeWritable(
+                        succ_range,
+                        &pages_made_writable,
+                    ) catch |err| switch (err) {
+                        error.MappingAlreadyExists => continue :successor,
+                        else => {
+                            log.err("{}", .{err});
+                            @panic("Unexpected Error");
+                        },
+                    };
+
+                    applyPatch(
+                        succ_request,
+                        succ_flicken,
+                        succ_range,
+                        succ_pii.num_prefixes,
+                    ) catch |err| switch (err) {
+                        error.RelocationOverflow => continue :successor,
+                        else => return err,
+                    };
+
+                    // Now that the successor is patched, we can create a new PII for the original
+                    // request.
+                    var orig_pii = PatchInstructionIterator.init(
+                        request.bytes,
+                        request.size,
+                        flicken.size(),
+                    );
+                    original: while (orig_pii.next(&patcher.address_allocator)) |orig_range| {
+                        try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(orig_range));
+                        patcher.ensureRangeWritable(
+                            orig_range,
+                            &pages_made_writable,
+                        ) catch |err| switch (err) {
+                            error.MappingAlreadyExists => continue :original,
+                            else => {
+                                log.err("{}", .{err});
+                                @panic("Unexpected Error");
+                            },
+                        };
+
+                        applyPatch(
+                            request,
+                            flicken,
+                            orig_range,
+                            orig_pii.num_prefixes,
+                        ) catch |err| switch (err) {
+                            error.RelocationOverflow => continue :original,
+                            else => return err,
+                        };
+
+                        try patcher.address_allocator.block(patcher.gpa, succ_range, 0);
+                        try patcher.address_allocator.block(patcher.gpa, orig_range, 0);
+                        const lock_size = request.size + jump_rel32_size + succ_pii.num_prefixes;
+                        locked_bytes.setRangeValue(
+                            .{ .start = request.offset, .end = request.offset + lock_size },
+                            true,
+                        );
+                        stats.successor_eviction += 1;
+                        continue :requests;
+                    }
+
+                    // We couldn't patch with the bytes. So revert to original ones.
+                    @memcpy(
+                        succ_request.bytes[0..succ_request.size],
+                        succ_orig_bytes[0..succ_request.size],
+                    );
                 }
-                break;
-            } else {
-                stats.failed += 1;
             }
+
+            stats.failed += 1;
         }
+
         // Change pages back to R|X.
         var iter = pages_made_writable.keyIterator();
         const protection = posix.PROT.READ | posix.PROT.EXEC;
@@ -300,9 +426,9 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
             try posix.mprotect(ptr[0..page_size], protection);
         }
 
+        assert(stats.total() == patch_requests.items.len);
         log.info("{}", .{stats});
-        log.info("{}", .{stats.successful()});
-        log.info("{}", .{stats.total()});
+        log.info("patched: {}/{}", .{ stats.successful(), stats.total() });
         log.info("patchRegion: Finished applying patches", .{});
     }
 }
@@ -312,7 +438,7 @@ fn applyPatch(
     flicken: Flicken,
     allocated_range: Range,
     num_prefixes: u8,
-) void {
+) !void {
     const flicken_addr: [*]u8 = @ptrFromInt(allocated_range.getStart(u64));
     const flicken_slice = flicken_addr[0..flicken.size()];
 
@@ -336,8 +462,8 @@ fn applyPatch(
     @memcpy(flicken_addr, flicken.bytes);
     if (request.flicken == .nop) {
         const instr_bytes = request.bytes[0..request.size];
-        const instr = disassembler.disassembleInstruction(instr_bytes);
-        relocateInstruction(
+        const instr = dis.disassembleInstruction(instr_bytes);
+        try relocateInstruction(
             instr.?,
             @intCast(allocated_range.start),
             flicken_slice[0..request.size],
@@ -457,9 +583,8 @@ const PatchInstructionIterator = struct {
 
     fn next(
         pii: *PatchInstructionIterator,
-        gpa: mem.Allocator,
         address_allocator: *AddressAllocator,
-    ) !?Range {
+    ) ?Range {
         const State = enum {
             allocation,
             range,
@@ -467,12 +592,14 @@ const PatchInstructionIterator = struct {
         };
         blk: switch (State.allocation) {
             .allocation => {
-                if (try address_allocator.allocate(
-                    gpa,
+                if (address_allocator.findAllocation(
                     pii.flicken_size,
                     pii.valid_range,
                 )) |allocated_range| {
                     assert(allocated_range.size() == pii.flicken_size);
+                    // Advancing the valid range, such that the next call to `findAllocation` won't
+                    // find the same range again.
+                    pii.valid_range.start = allocated_range.start + 1;
                     return allocated_range;
                 } else {
                     continue :blk .range;
@@ -520,10 +647,10 @@ const PatchInstructionIterator = struct {
 
 /// Fixes RIP-relative operands in an instruction that has been moved to a new address.
 fn relocateInstruction(
-    instruction: disassembler.BundledInstruction,
+    instruction: dis.BundledInstruction,
     address: u64,
     buffer: []u8,
-) void {
+) !void {
     const instr = instruction.instruction;
     // Iterate all operands
     var i: u8 = 0;
@@ -546,14 +673,13 @@ fn relocateInstruction(
             instruction.address,
             &result_address,
         );
-        assert(zydis.ZYAN_SUCCESS(status));
+        assert(zydis.ZYAN_SUCCESS(status)); // TODO: maybe return an error insteadt
 
         const new_disp: i32 = blk: {
             const next_rip: i64 = @intCast(address + instr.length);
             const new_disp = @as(i64, @intCast(result_address)) - next_rip;
             if (new_disp > math.maxInt(i32) or new_disp < math.minInt(i32)) {
-                // TODO: Handle relocation overflow (e.g. by expanding instruction or failing gracefully)
-                @panic("RelocationOverflow while relocating instruction");
+                return error.RelocationOverflow;
             }
             break :blk @intCast(new_disp);
         };
