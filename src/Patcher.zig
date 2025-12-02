@@ -426,6 +426,7 @@ fn attemptSuccessorEviction(
             flicken.size(),
         );
         while (orig_pii.next(&patcher.address_allocator)) |orig_range| {
+            if (succ_range.touches(orig_range)) continue;
             try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(orig_range));
             patcher.ensureRangeWritable(
                 orig_range,
