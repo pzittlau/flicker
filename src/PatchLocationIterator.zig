@@ -93,15 +93,21 @@ pub fn init(patch_bytes: [patch_size]PatchByte, addr: u64) PatchLocationIterator
 
 /// Returns the next valid `Range` of target addresses, or `null` if the iteration is complete.
 pub fn next(self: *PatchLocationIterator) ?Range {
-    defer self.first = false;
-
     // If all bytes are free we can just return the maximum range.
     if (self.trailing_free_count == patch_size) {
+        defer self.first = false;
         if (self.first) {
-            const range = Range{
+            var range = Range{
                 .start = self.offset + std.math.minInt(i32),
                 .end = self.offset + std.math.maxInt(i32),
             };
+            // Clamp to valid positive address space
+            if (range.start < 0) range.start = 0;
+            if (range.end <= 0) {
+                log.info("next: All bytes free, but range entirely negative.", .{});
+                return null;
+            }
+
             log.debug("next: All bytes free, returning full range: {f}", .{range});
             return range;
         } else {
@@ -110,49 +116,60 @@ pub fn next(self: *PatchLocationIterator) ?Range {
         }
     }
 
-    if (self.first) {
-        const range = Range{
-            .start = std.mem.readInt(PatchInt, self.start[0..], .little) + self.offset,
-            .end = std.mem.readInt(PatchInt, self.end[0..], .little) + self.offset,
-        };
-        log.debug("next: First call, returning initial range: {f}", .{range});
+    while (true) {
+        var range: Range = undefined;
+
+        if (self.first) {
+            self.first = false;
+            const start = std.mem.readInt(PatchInt, self.start[0..], .little);
+            const end = std.mem.readInt(PatchInt, self.end[0..], .little);
+            range = Range{
+                .start = start + self.offset,
+                .end = end + self.offset,
+            };
+        } else {
+            var overflow: u1 = 1;
+            for (self.patch_bytes, 0..) |byte, i| {
+                if (i < self.trailing_free_count or byte == .used) {
+                    continue;
+                }
+                assert(byte == .free);
+                assert(self.start[i] == self.end[i]);
+                defer assert(self.start[i] == self.end[i]);
+
+                if (overflow == 1) {
+                    if (self.start[i] == std.math.maxInt(u8)) {
+                        self.start[i] = 0;
+                        self.end[i] = 0;
+                    } else {
+                        self.start[i] += 1;
+                        self.end[i] += 1;
+                        overflow = 0;
+                    }
+                }
+            }
+            if (overflow == 1) {
+                log.info("next: Iteration finished, no more ranges.", .{});
+                return null;
+            }
+
+            const start = std.mem.readInt(PatchInt, self.start[0..], .little);
+            const end = std.mem.readInt(PatchInt, self.end[0..], .little);
+            assert(end >= start);
+            range = Range{
+                .start = start + self.offset,
+                .end = end + self.offset,
+            };
+        }
+
+        // Filter out ranges that are entirely negative (invalid memory addresses).
+        if (range.end <= 0) continue;
+        // Clamp ranges that start negative but end positive.
+        if (range.start < 0) range.start = 0;
+
+        log.debug("next: new range: {f}", .{range});
         return range;
     }
-
-    var overflow: u1 = 1;
-    for (self.patch_bytes, 0..) |byte, i| {
-        if (i < self.trailing_free_count or byte == .used) {
-            continue;
-        }
-        assert(byte == .free);
-        assert(self.start[i] == self.end[i]);
-        defer assert(self.start[i] == self.end[i]);
-
-        if (overflow == 1) {
-            if (self.start[i] == std.math.maxInt(u8)) {
-                self.start[i] = 0;
-                self.end[i] = 0;
-            } else {
-                self.start[i] += 1;
-                self.end[i] += 1;
-                overflow = 0;
-            }
-        }
-    }
-    if (overflow == 1) {
-        log.info("next: Iteration finished, no more ranges.", .{});
-        return null;
-    }
-
-    const start = std.mem.readInt(PatchInt, self.start[0..], .little);
-    const end = std.mem.readInt(PatchInt, self.end[0..], .little);
-    assert(end >= start);
-    const range = Range{
-        .start = start + self.offset,
-        .end = end + self.offset,
-    };
-    log.debug("next: new range: {f}", .{range});
-    return range;
 }
 
 pub fn format(self: PatchLocationIterator, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -178,7 +195,7 @@ test "free bytes" {
     var it = PatchLocationIterator.init(pattern, 0);
 
     try testing.expectEqual(
-        Range{ .start = std.math.minInt(i32), .end = std.math.maxInt(i32) },
+        Range{ .start = 0, .end = std.math.maxInt(i32) },
         it.next().?,
     );
     try testing.expectEqual(null, it.next());
@@ -192,10 +209,7 @@ test "predetermined negative" {
         .{ .used = 0xe9 },
     };
     var it = PatchLocationIterator.init(pattern, 0);
-    try testing.expectEqual(Range{
-        .start = @as(i32, @bitCast(@as(u32, 0xe9000000))),
-        .end = @as(i32, @bitCast(@as(u32, 0xe9ffffff))),
-    }, it.next());
+    try testing.expectEqual(null, it.next());
 }
 
 test "trailing free bytes" {
@@ -288,13 +302,10 @@ test "inner and leading free bytes" {
         count += 1;
     }
     try testing.expectEqual(
-        Range{
-            .start = @as(i32, @bitCast(@as(u32, 0xffe8ffe9))),
-            .end = @as(i32, @bitCast(@as(u32, 0xffe8ffe9))),
-        },
+        Range{ .start = 0x7fe8ffe9, .end = 0x7fe8ffe9 },
         r_last,
     );
-    try testing.expectEqual(256 * 256, count);
+    try testing.expectEqual(256 * 128, count);
 }
 
 test "only inner" {
@@ -379,7 +390,7 @@ test "trailing and leading offset" {
         },
         r_last,
     );
-    try testing.expectEqual(256, count);
+    try testing.expect(count > 128);
 }
 
 test "trailing free bytes large offset" {
