@@ -288,6 +288,15 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
             )) {
                 continue :requests;
             }
+
+            if (try patcher.attemptNeighborEviction(
+                request,
+                arena,
+                &locked_bytes,
+                &pages_made_writable,
+                &instruction_starts,
+                &stats,
+            )) {
                 continue :requests;
             }
 
@@ -488,6 +497,212 @@ fn attemptSuccessorEviction(
             succ_orig_bytes[0..succ_request.size],
         );
     }
+    return false;
+}
+
+fn attemptNeighborEviction(
+    patcher: *Patcher,
+    request: PatchRequest,
+    arena: mem.Allocator,
+    locked_bytes: *std.DynamicBitSetUnmanaged,
+    pages_made_writable: *std.AutoHashMapUnmanaged(u64, void),
+    instruction_starts: *const std.DynamicBitSetUnmanaged,
+    stats: *Statistics,
+) !bool {
+    // Iterate valid neighbors.
+    // Neighbors must be within [-128, 127] range for a short jump.
+    // Since we patch back-to-front, we only look at neighbors *after* the current instruction
+    // (higher address) to avoid evicting an instruction we haven't processed/patched yet.
+    // Short jump is 2 bytes (EB xx). Target is IP + 2 + xx.
+    // So min offset is +2 (xx=0). Max offset is +2+127 = +129.
+    const start_offset = request.offset + 2;
+    const end_offset = @min(
+        start_offset + 128, // 2 + 128
+        request.bytes.len + request.offset,
+    );
+
+    neighbor: for (start_offset..end_offset) |neighbor_offset| {
+        if (!instruction_starts.isSet(neighbor_offset)) continue;
+
+        // Found a candidate victim instruction.
+        // We must access it relative to the request bytes slice.
+        const victim_bytes_all = request.bytes[neighbor_offset - request.offset ..];
+
+        // Disassemble to get size.
+        // PERF: We could also search for the next set bit in instruction_starts
+        const victim_instr = dis.disassembleInstruction(victim_bytes_all) orelse continue;
+        const victim_size = victim_instr.instruction.length;
+        const victim_bytes = victim_bytes_all[0..victim_size];
+
+        // Check locks for victim.
+        for (0..victim_size) |i| {
+            if (locked_bytes.isSet(neighbor_offset + i)) {
+                continue :neighbor;
+            }
+        }
+
+        // Save original bytes to revert.
+        var victim_orig_bytes: [15]u8 = undefined;
+        @memcpy(victim_orig_bytes[0..victim_size], victim_bytes);
+
+        // OUTER LOOP: J_Patch
+        // Iterate possible offsets 'k' inside the victim for the patch jump.
+        // J_Patch is 5 bytes. It can extend beyond victim.
+        for (1..victim_size) |k| {
+            // Check if short jump from P reaches V+k
+            const target: i64 = @intCast(neighbor_offset + k);
+            const source: i64 = @intCast(request.offset + 2);
+            const disp = target - source;
+            if (disp > 127 or disp < -128) continue; // Should be covered by loop bounds, but be safe.
+
+            const patch_flicken: Flicken = if (request.flicken == .nop)
+                .{ .name = "nop", .bytes = request.bytes[0..request.size] }
+            else
+                patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
+
+            // Constraints for J_Patch:
+            // Bytes [0 .. victim_size - k] are free (inside victim).
+            // Bytes [victim_size - k .. ] are used (outside victim, immutable).
+            var patch_pii = PatchInstructionIterator.init(
+                victim_bytes_all[k..],
+                @intCast(victim_size - k),
+                patch_flicken.size(),
+            );
+
+            while (patch_pii.next(&patcher.address_allocator)) |patch_range| {
+                // J_Patch MUST NOT use prefixes, because it's punned inside J_Victim.
+                // Adding prefixes would shift J_Patch relative to J_Victim, making constraints harder.
+                if (patch_pii.num_prefixes > 0) break;
+
+                try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(patch_range));
+                patcher.ensureRangeWritable(patch_range, pages_made_writable) catch |err| switch (err) {
+                    error.MappingAlreadyExists => continue,
+                    else => return err,
+                };
+
+                // Tentatively write J_Patch to memory to set constraints for J_Victim.
+                // We must perform the write logic manually because applyPatch assumes request struct.
+                // We only need to write the bytes of J_Patch that land inside the victim.
+                {
+                    const jmp_target = patch_range.start;
+                    const jmp_source: i64 = @intCast(@intFromPtr(&victim_bytes_all[k]) + 5);
+                    const rel32: i32 = @intCast(jmp_target - jmp_source);
+                    victim_bytes_all[k] = jump_rel32;
+                    mem.writeInt(i32, victim_bytes_all[k + 1 ..][0..4], rel32, .little);
+                }
+
+                // INNER LOOP: J_Victim
+                // Constraints:
+                // Bytes [0 .. k] are free (before J_Patch).
+                // Bytes [k .. ] are used (overlap J_Patch).
+                const victim_flicken = Flicken{
+                    .name = "nop",
+                    .bytes = victim_orig_bytes[0..victim_size],
+                };
+
+                var victim_pii = PatchInstructionIterator.init(
+                    victim_bytes_all,
+                    @intCast(k),
+                    victim_flicken.size(),
+                );
+
+                while (victim_pii.next(&patcher.address_allocator)) |victim_range| {
+                    if (patch_range.touches(victim_range)) continue;
+
+                    try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(victim_range));
+                    patcher.ensureRangeWritable(victim_range, pages_made_writable) catch |err| switch (err) {
+                        error.MappingAlreadyExists => continue,
+                        else => return err,
+                    };
+
+                    // SUCCESS! Commit everything.
+
+                    // 1. Write Patch Trampoline (J_Patch target)
+                    {
+                        const trampoline: [*]u8 = @ptrFromInt(patch_range.getStart(u64));
+                        @memcpy(trampoline, patch_flicken.bytes);
+                        if (request.flicken == .nop) {
+                            const instr = dis.disassembleInstruction(patch_flicken.bytes).?;
+                            try relocateInstruction(
+                                instr,
+                                @intCast(patch_range.start),
+                                trampoline[0..patch_flicken.bytes.len],
+                            );
+                        }
+                        // Jmp back from Patch Trampoline to original code (after request)
+                        trampoline[patch_flicken.bytes.len] = jump_rel32;
+                        const ret_addr: i64 = @intCast(@intFromPtr(&request.bytes[request.size]));
+                        const from = patch_range.end;
+                        const jmp_back_disp: i32 = @intCast(ret_addr - from);
+                        mem.writeInt(i32, trampoline[patch_flicken.bytes.len + 1 ..][0..4], jmp_back_disp, .little);
+                    }
+
+                    // 2. Write Victim Trampoline (J_Victim target)
+                    {
+                        const trampoline: [*]u8 = @ptrFromInt(victim_range.getStart(u64));
+                        @memcpy(trampoline, victim_orig_bytes[0..victim_size]);
+                        // Relocate victim instruction
+                        const instr = dis.disassembleInstruction(victim_orig_bytes[0..victim_size]).?;
+                        try relocateInstruction(
+                            instr,
+                            @intCast(victim_range.start),
+                            trampoline[0..victim_size],
+                        );
+                        // Jmp back from Victim Trampoline to original code (after victim)
+                        trampoline[victim_size] = jump_rel32;
+                        const ret_addr: i64 = @intCast(@intFromPtr(&victim_bytes_all[victim_size]));
+                        const from = victim_range.end;
+                        const jmp_back_disp: i32 = @intCast(ret_addr - from);
+                        mem.writeInt(i32, trampoline[victim_size + 1 ..][0..4], jmp_back_disp, .little);
+                    }
+
+                    // 3. Write J_Victim (overwrites head of J_Patch which is fine, we just used it for constraints)
+                    applyPatch(
+                        // Create a fake request for the victim part
+                        .{
+                            .flicken = .nop, // Irrelevant, unused by applyPatch for jump writing
+                            .offset = neighbor_offset,
+                            .size = @intCast(victim_size),
+                            .bytes = victim_bytes_all,
+                        },
+                        victim_flicken, // Unused by applyPatch for jump writing
+                        victim_range,
+                        victim_pii.num_prefixes,
+                    ) catch unreachable; // Should fit because we allocated it
+
+                    // 4. Write J_Short at request
+                    request.bytes[0] = jump_rel8;
+                    request.bytes[1] = @intCast(disp);
+                    if (request.size > 2) {
+                        @memset(request.bytes[2..request.size], int3);
+                    }
+
+                    // 5. Locking
+                    try patcher.address_allocator.block(patcher.gpa, patch_range, 0);
+                    try patcher.address_allocator.block(patcher.gpa, victim_range, 0);
+
+                    locked_bytes.setRangeValue(
+                        .{ .start = request.offset, .end = request.offset + request.size },
+                        true,
+                    );
+                    // Lock victim range + any extension of J_Patch
+                    const j_patch_end = neighbor_offset + k + 5;
+                    const lock_end = @max(neighbor_offset + victim_size, j_patch_end);
+                    locked_bytes.setRangeValue(
+                        .{ .start = neighbor_offset, .end = lock_end },
+                        true,
+                    );
+
+                    stats.neighbor_eviction += 1;
+                    return true;
+                }
+
+                // Revert J_Patch write for next iteration
+                @memcpy(victim_bytes, victim_orig_bytes[0..victim_size]);
+            }
+        }
+    }
+
     return false;
 }
 
