@@ -53,6 +53,9 @@ pub fn main() !void {
 
     // Initialize patcher
     patcher = try Patcher.init(std.heap.page_allocator); // TODO: allocator
+    // Block the first 64k to avoid mmap_min_addr (EPERM) issues on Linux.
+    // TODO: read it from `/proc/sys/vm/mmap_min_addr` instead.
+    try patcher.address_allocator.block(patcher.gpa, .{ .start = 0, .end = 0x10000 }, 0);
 
     // Map file into memory
     const file = try lookupFile(mem.sliceTo(std.os.argv[arg_index], 0));
