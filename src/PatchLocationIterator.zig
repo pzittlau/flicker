@@ -95,22 +95,14 @@ pub fn init(patch_bytes: [patch_size]PatchByte, addr: u64) PatchLocationIterator
 pub fn next(self: *PatchLocationIterator) ?Range {
     defer self.first = false;
 
-    // If the first byte is predetermined and the offset would always be negative we don't need to
-    // iterate.
-    const last_byte = self.patch_bytes[patch_size - 1];
-    if (last_byte == .used and last_byte.used & 0x80 != 0) {
-        log.info(
-            "next: Search aborted, pattern has predetermined negative offset (last_byte=0x{x})",
-            .{last_byte.used},
-        );
-        return null;
-    }
-
     // If all bytes are free we can just return the maximum range.
     if (self.trailing_free_count == patch_size) {
         if (self.first) {
-            const range = Range{ .start = self.offset, .end = self.offset + std.math.maxInt(i32) };
-            log.debug("next: All bytes free, returning full positive range: {f}", .{range});
+            const range = Range{
+                .start = self.offset + std.math.minInt(i32),
+                .end = self.offset + std.math.maxInt(i32),
+            };
+            log.debug("next: All bytes free, returning full range: {f}", .{range});
             return range;
         } else {
             log.info("next: All bytes free, iteration finished.", .{});
@@ -137,8 +129,7 @@ pub fn next(self: *PatchLocationIterator) ?Range {
         defer assert(self.start[i] == self.end[i]);
 
         if (overflow == 1) {
-            const max: u8 = if (i < patch_size - 1) std.math.maxInt(u8) else std.math.maxInt(i8);
-            if (self.start[i] == max) {
+            if (self.start[i] == std.math.maxInt(u8)) {
                 self.start[i] = 0;
                 self.end[i] = 0;
             } else {
@@ -187,7 +178,7 @@ test "free bytes" {
     var it = PatchLocationIterator.init(pattern, 0);
 
     try testing.expectEqual(
-        Range{ .start = 0x00000000, .end = 0x7fffffff },
+        Range{ .start = std.math.minInt(i32), .end = std.math.maxInt(i32) },
         it.next().?,
     );
     try testing.expectEqual(null, it.next());
@@ -201,9 +192,10 @@ test "predetermined negative" {
         .{ .used = 0xe9 },
     };
     var it = PatchLocationIterator.init(pattern, 0);
-    try testing.expectEqual(null, it.next());
-    it = PatchLocationIterator.init(pattern, 0x12345678);
-    try testing.expectEqual(null, it.next());
+    try testing.expectEqual(Range{
+        .start = @as(i32, @bitCast(@as(u32, 0xe9000000))),
+        .end = @as(i32, @bitCast(@as(u32, 0xe9ffffff))),
+    }, it.next());
 }
 
 test "trailing free bytes" {
@@ -296,10 +288,13 @@ test "inner and leading free bytes" {
         count += 1;
     }
     try testing.expectEqual(
-        Range{ .start = 0x7fe8ffe9, .end = 0x7fe8ffe9 },
+        Range{
+            .start = @as(i32, @bitCast(@as(u32, 0xffe8ffe9))),
+            .end = @as(i32, @bitCast(@as(u32, 0xffe8ffe9))),
+        },
         r_last,
     );
-    try testing.expectEqual(256 * 128, count);
+    try testing.expectEqual(256 * 256, count);
 }
 
 test "only inner" {
@@ -378,10 +373,13 @@ test "trailing and leading offset" {
         count += 1;
     }
     try testing.expectEqual(
-        Range{ .start = offset + 0x7fe8e900, .end = offset + 0x7fe8e9ff },
+        Range{
+            .start = offset + @as(i32, @bitCast(@as(u32, 0xffe8e900))),
+            .end = offset + @as(i32, @bitCast(@as(u32, 0xffe8e9ff))),
+        },
         r_last,
     );
-    try testing.expectEqual(128, count);
+    try testing.expectEqual(256, count);
 }
 
 test "trailing free bytes large offset" {
@@ -408,7 +406,7 @@ test "trailing and leading large offset" {
         .{ .used = 0xe8 },
         .{ .free = {} },
     };
-    const offset = 0x12345678;
+    const offset = 0x123456789a;
     var it = PatchLocationIterator.init(pattern, offset);
 
     try testing.expectEqual(
@@ -428,8 +426,11 @@ test "trailing and leading large offset" {
         count += 1;
     }
     try testing.expectEqual(
-        Range{ .start = offset + 0x7fe8e900, .end = offset + 0x7fe8e9ff },
+        Range{
+            .start = offset + @as(i64, @intCast(@as(i32, @bitCast(@as(u32, 0xffe8e900))))),
+            .end = offset + @as(i64, @intCast(@as(i32, @bitCast(@as(u32, 0xffe8e9ff))))),
+        },
         r_last,
     );
-    try testing.expectEqual(128, count);
+    try testing.expectEqual(256, count);
 }
