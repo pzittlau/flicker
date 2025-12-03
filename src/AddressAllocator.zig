@@ -147,11 +147,22 @@ pub fn findAllocation(
     if (size == 0) return null;
     const size_i: i64 = @intCast(size);
 
-    // OPTIM: Use binary search to find the start of the valid range inside the reserved ranges.
-
+    const start_idx = sort.lowerBound(
+        Range,
+        address_allocator.ranges.items,
+        valid_range,
+        Range.compare,
+    );
     // `candidate_start` tracks the beginning of the current free region being examined.
     var candidate_start = valid_range.start;
-    for (address_allocator.ranges.items) |reserved| {
+    // If the range before the start index overlaps with our search start, we have to adjust.
+    if (start_idx > 0) {
+        const prev = address_allocator.ranges.items[start_idx - 1];
+        if (prev.end > candidate_start) {
+            candidate_start = prev.end;
+        }
+    }
+    for (address_allocator.ranges.items[start_idx..]) |reserved| {
         if (candidate_start >= valid_range.end) {
             log.debug("findAllocation: Searched past the valid range.", .{});
             break;
