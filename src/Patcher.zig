@@ -137,18 +137,25 @@ pub const Statistics = struct {
 
     pub const empty = mem.zeroes(Statistics);
 
-    pub fn punningSum(statistics: *const Statistics) u64 {
-        return statistics.punning[0] + statistics.punning[1] +
-            statistics.punning[2] + statistics.punning[3];
+    pub fn punningSum(stats: *const Statistics) u64 {
+        return stats.punning[0] + stats.punning[1] +
+            stats.punning[2] + stats.punning[3];
     }
 
-    pub fn successful(statistics: *const Statistics) u64 {
-        return statistics.jump + statistics.punningSum() +
-            statistics.successor_eviction + statistics.neighbor_eviction;
+    pub fn successful(stats: *const Statistics) u64 {
+        return stats.jump + stats.punningSum() +
+            stats.successor_eviction + stats.neighbor_eviction;
     }
 
-    pub fn total(statistics: *const Statistics) u64 {
-        return statistics.successful() + statistics.failed;
+    pub fn total(stats: *const Statistics) u64 {
+        return stats.successful() + stats.failed;
+    }
+
+    pub fn percentage(stats: *const Statistics) f64 {
+        if (stats.total() == 0) return 1;
+        const s: f64 = @floatFromInt(stats.successful());
+        const t: f64 = @floatFromInt(stats.total());
+        return s / t;
     }
 
     pub fn add(self: *Statistics, other: *const Statistics) void {
@@ -262,11 +269,25 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
                 }
             }
 
-            if (try patcher.attemptDirectOrPunning(request, arena, &locked_bytes, &pages_made_writable, &stats)) {
+            if (try patcher.attemptDirectOrPunning(
+                request,
+                arena,
+                &locked_bytes,
+                &pages_made_writable,
+                &stats,
+            )) {
                 continue :requests;
             }
 
-            if (try patcher.attemptSuccessorEviction(request, arena, &locked_bytes, &pages_made_writable, &stats)) {
+            if (try patcher.attemptSuccessorEviction(
+                request,
+                arena,
+                &locked_bytes,
+                &pages_made_writable,
+                &stats,
+            )) {
+                continue :requests;
+            }
                 continue :requests;
             }
 
@@ -283,7 +304,11 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
 
         assert(stats.total() == patch_requests.items.len);
         log.info("{}", .{stats});
-        log.info("patched: {}/{}", .{ stats.successful(), stats.total() });
+        log.info("patched: {}/{}: {:2.2}%", .{
+            stats.successful(),
+            stats.total(),
+            stats.percentage() * 100,
+        });
         log.info("patchRegion: Finished applying patches", .{});
     }
 }
