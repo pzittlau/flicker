@@ -169,6 +169,11 @@ pub const Statistics = struct {
     }
 };
 
+/// Scans a memory region for instructions that require patching and applies the patches
+/// using a hierarchy of tactics (Direct/Punning -> Successor Eviction -> Neighbor Eviction).
+///
+/// The region is processed Back-to-Front to ensure that modifications (punning) only
+/// constrain instructions that have already been processed or are locked.
 pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
     {
         // Block the region, such that we don't try to allocate there anymore.
@@ -509,51 +514,43 @@ fn attemptNeighborEviction(
     instruction_starts: *const std.DynamicBitSetUnmanaged,
     stats: *Statistics,
 ) !bool {
-    // Iterate valid neighbors.
-    // Neighbors must be within [-128, 127] range for a short jump.
+    // Valid neighbors must be within [-128, 127] range for a short jump.
     // Since we patch back-to-front, we only look at neighbors *after* the current instruction
     // (higher address) to avoid evicting an instruction we haven't processed/patched yet.
-    // Short jump is 2 bytes (EB xx). Target is IP + 2 + xx.
-    // So min offset is +2 (xx=0). Max offset is +2+127 = +129.
     const start_offset = request.offset + 2;
     const end_offset = @min(
-        start_offset + 128, // 2 + 128
+        start_offset + 128,
         request.bytes.len + request.offset,
     );
 
     neighbor: for (start_offset..end_offset) |neighbor_offset| {
         if (!instruction_starts.isSet(neighbor_offset)) continue;
 
-        // Found a candidate victim instruction.
-        // We must access it relative to the request bytes slice.
         const victim_bytes_all = request.bytes[neighbor_offset - request.offset ..];
 
-        // Disassemble to get size.
         // PERF: We could also search for the next set bit in instruction_starts
         const victim_instr = dis.disassembleInstruction(victim_bytes_all) orelse continue;
         const victim_size = victim_instr.instruction.length;
         const victim_bytes = victim_bytes_all[0..victim_size];
 
-        // Check locks for victim.
         for (0..victim_size) |i| {
             if (locked_bytes.isSet(neighbor_offset + i)) {
                 continue :neighbor;
             }
         }
 
-        // Save original bytes to revert.
+        // Save original bytes to revert if constraints cannot be solved.
         var victim_orig_bytes: [15]u8 = undefined;
         @memcpy(victim_orig_bytes[0..victim_size], victim_bytes);
 
         // OUTER LOOP: J_Patch
         // Iterate possible offsets 'k' inside the victim for the patch jump.
-        // J_Patch is 5 bytes. It can extend beyond victim.
-        for (1..victim_size) |k| {
-            // Check if short jump from P reaches V+k
+        var k: u8 = 1;
+        while (k < victim_size) : (k += 1) {
             const target: i64 = @intCast(neighbor_offset + k);
             const source: i64 = @intCast(request.offset + 2);
             const disp = target - source;
-            if (disp > 127 or disp < -128) continue; // Should be covered by loop bounds, but be safe.
+            if (disp > 127 or disp < -128) continue;
 
             const patch_flicken: Flicken = if (request.flicken == .nop)
                 .{ .name = "nop", .bytes = request.bytes[0..request.size] }
@@ -581,7 +578,6 @@ fn attemptNeighborEviction(
                 };
 
                 // Tentatively write J_Patch to memory to set constraints for J_Victim.
-                // We must perform the write logic manually because applyPatch assumes request struct.
                 // We only need to write the bytes of J_Patch that land inside the victim.
                 {
                     const jmp_target = patch_range.start;
@@ -602,7 +598,7 @@ fn attemptNeighborEviction(
 
                 var victim_pii = PatchInstructionIterator.init(
                     victim_bytes_all,
-                    @intCast(k),
+                    k,
                     victim_flicken.size(),
                 );
 
@@ -620,55 +616,42 @@ fn attemptNeighborEviction(
                     // 1. Write Patch Trampoline (J_Patch target)
                     {
                         const trampoline: [*]u8 = @ptrFromInt(patch_range.getStart(u64));
-                        @memcpy(trampoline, patch_flicken.bytes);
+                        var reloc_info: ?RelocInfo = null;
                         if (request.flicken == .nop) {
-                            const instr = dis.disassembleInstruction(patch_flicken.bytes).?;
-                            try relocateInstruction(
-                                instr,
-                                @intCast(patch_range.start),
-                                trampoline[0..patch_flicken.bytes.len],
-                            );
+                            reloc_info = .{
+                                .instr = dis.disassembleInstruction(patch_flicken.bytes).?,
+                                .old_addr = @intFromPtr(request.bytes.ptr),
+                            };
                         }
-                        // Jmp back from Patch Trampoline to original code (after request)
-                        trampoline[patch_flicken.bytes.len] = jump_rel32;
-                        const ret_addr: i64 = @intCast(@intFromPtr(&request.bytes[request.size]));
-                        const from = patch_range.end;
-                        const jmp_back_disp: i32 = @intCast(ret_addr - from);
-                        mem.writeInt(i32, trampoline[patch_flicken.bytes.len + 1 ..][0..4], jmp_back_disp, .little);
+                        try commitTrampoline(
+                            trampoline,
+                            patch_flicken.bytes,
+                            reloc_info,
+                            @intFromPtr(request.bytes.ptr) + request.size,
+                        );
                     }
 
                     // 2. Write Victim Trampoline (J_Victim target)
                     {
                         const trampoline: [*]u8 = @ptrFromInt(victim_range.getStart(u64));
-                        @memcpy(trampoline, victim_orig_bytes[0..victim_size]);
-                        // Relocate victim instruction
-                        const instr = dis.disassembleInstruction(victim_orig_bytes[0..victim_size]).?;
-                        try relocateInstruction(
-                            instr,
-                            @intCast(victim_range.start),
-                            trampoline[0..victim_size],
+                        try commitTrampoline(
+                            trampoline,
+                            victim_orig_bytes[0..victim_size],
+                            .{
+                                .instr = dis.disassembleInstruction(victim_orig_bytes[0..victim_size]).?,
+                                .old_addr = @intFromPtr(victim_bytes_all.ptr),
+                            },
+                            @intFromPtr(victim_bytes_all.ptr) + victim_size,
                         );
-                        // Jmp back from Victim Trampoline to original code (after victim)
-                        trampoline[victim_size] = jump_rel32;
-                        const ret_addr: i64 = @intCast(@intFromPtr(&victim_bytes_all[victim_size]));
-                        const from = victim_range.end;
-                        const jmp_back_disp: i32 = @intCast(ret_addr - from);
-                        mem.writeInt(i32, trampoline[victim_size + 1 ..][0..4], jmp_back_disp, .little);
                     }
 
-                    // 3. Write J_Victim (overwrites head of J_Patch which is fine, we just used it for constraints)
-                    applyPatch(
-                        // Create a fake request for the victim part
-                        .{
-                            .flicken = .nop, // Irrelevant, unused by applyPatch for jump writing
-                            .offset = neighbor_offset,
-                            .size = @intCast(victim_size),
-                            .bytes = victim_bytes_all,
-                        },
-                        victim_flicken, // Unused by applyPatch for jump writing
-                        victim_range,
+                    // 3. Write J_Victim (overwrites head of J_Patch which is fine)
+                    commitJump(
+                        victim_bytes_all.ptr,
+                        @intCast(victim_range.start),
                         victim_pii.num_prefixes,
-                    ) catch unreachable; // Should fit because we allocated it
+                        k, // Total size for padding is limited to k to preserve J_Patch tail
+                    );
 
                     // 4. Write J_Short at request
                     request.bytes[0] = jump_rel8;
@@ -706,6 +689,10 @@ fn attemptNeighborEviction(
     return false;
 }
 
+/// Applies a standard patch (T1/B1/B2) where the instruction is replaced by a jump to a trampoline.
+///
+/// This handles the logic of writing the trampoline content (including relocation) and
+/// overwriting the original instruction with a `JMP` (plus prefixes/padding).
 fn applyPatch(
     request: PatchRequest,
     flicken: Flicken,
@@ -713,51 +700,78 @@ fn applyPatch(
     num_prefixes: u8,
 ) !void {
     const flicken_addr: [*]u8 = @ptrFromInt(allocated_range.getStart(u64));
-    const flicken_slice = flicken_addr[0..flicken.size()];
 
-    const jump_to_offset: i32 = blk: {
-        const from: i64 = @intCast(@intFromPtr(&request.bytes[
-            num_prefixes + jump_rel32_size
-        ]));
-        const to = allocated_range.start;
-        break :blk @intCast(to - from);
-    };
-    const jump_back_offset: i32 = blk: {
-        const from = allocated_range.end;
-        const to: i64 = @intCast(@intFromPtr(&request.bytes[request.size]));
-        break :blk @intCast(to - from);
-    };
-    // The jumps have to be in the opposite direction.
-    assert(math.sign(jump_to_offset) * math.sign(jump_back_offset) < 0);
-
-    // Write to the trampoline first, because for the `nop` flicken `flicken.bytes` points to
-    // `request.bytes` which we overwrite in the next step.
-    @memcpy(flicken_addr, flicken.bytes);
+    // Commit Trampoline
+    var reloc_info: ?RelocInfo = null;
     if (request.flicken == .nop) {
-        const instr_bytes = request.bytes[0..request.size];
-        const instr = dis.disassembleInstruction(instr_bytes).?;
+        reloc_info = .{
+            .instr = dis.disassembleInstruction(request.bytes[0..request.size]).?,
+            .old_addr = @intFromPtr(request.bytes.ptr),
+        };
+    }
+
+    const ret_addr = @intFromPtr(request.bytes.ptr) + request.size;
+    try commitTrampoline(flicken_addr, flicken.bytes, reloc_info, ret_addr);
+
+    // Commit Jump (Patch)
+    commitJump(request.bytes.ptr, @intCast(allocated_range.start), num_prefixes, request.size);
+}
+
+const RelocInfo = struct {
+    instr: dis.BundledInstruction,
+    old_addr: u64,
+};
+
+/// Helper to write code into a trampoline.
+///
+/// It copies the original bytes (or flicken content), relocates any RIP-relative instructions
+/// to be valid at the new address, and appends a jump back to the instruction stream.
+fn commitTrampoline(
+    trampoline_ptr: [*]u8,
+    content: []const u8,
+    reloc_info: ?RelocInfo,
+    return_addr: u64,
+) !void {
+    @memcpy(trampoline_ptr[0..content.len], content);
+
+    if (reloc_info) |info| {
         try relocateInstruction(
-            instr,
-            @intCast(allocated_range.start),
-            flicken_slice[0..request.size],
+            info.instr,
+            @intFromPtr(trampoline_ptr),
+            trampoline_ptr[0..content.len],
         );
     }
-    flicken_slice[flicken.bytes.len] = jump_rel32;
-    const jump_back_location = flicken_slice[flicken.bytes.len + 1 ..][0..4];
-    mem.writeInt(i32, jump_back_location, jump_back_offset, .little);
 
-    @memcpy(request.bytes[0..num_prefixes], prefixes[0..num_prefixes]);
-    request.bytes[num_prefixes] = jump_rel32;
-    mem.writeInt(
-        i32,
-        request.bytes[num_prefixes + 1 ..][0..4],
-        jump_to_offset,
-        .little,
-    );
-    // Pad remaining with int3.
+    // Write jump back
+    trampoline_ptr[content.len] = jump_rel32;
+    const jump_src = @intFromPtr(trampoline_ptr) + content.len + jump_rel32_size;
+    const jump_disp: i32 = @intCast(@as(i64, @intCast(return_addr)) - @as(i64, @intCast(jump_src)));
+    mem.writeInt(i32, trampoline_ptr[content.len + 1 ..][0..4], jump_disp, .little);
+}
+
+/// Helper to overwrite an instruction with a jump to a trampoline.
+///
+/// It handles writing optional prefixes (padding), the `0xE9` opcode, the relative offset,
+/// and fills any remaining bytes of the original instruction with `INT3` to prevent
+/// execution of garbage bytes.
+fn commitJump(
+    from_ptr: [*]u8,
+    to_addr: u64,
+    num_prefixes: u8,
+    total_size: usize,
+) void {
+    const prefixes_slice = from_ptr[0..num_prefixes];
+    @memcpy(prefixes_slice, prefixes[0..num_prefixes]);
+
+    from_ptr[num_prefixes] = jump_rel32;
+
+    const jump_src = @intFromPtr(from_ptr) + num_prefixes + jump_rel32_size;
+    const jump_disp: i32 = @intCast(@as(i64, @intCast(to_addr)) - @as(i64, @intCast(jump_src)));
+    mem.writeInt(i32, from_ptr[num_prefixes + 1 ..][0..4], jump_disp, .little);
+
     const patch_end_index = num_prefixes + jump_rel32_size;
-    if (patch_end_index < request.size) {
-        @memset(request.bytes[patch_end_index..request.size], int3);
+    if (patch_end_index < total_size) {
+        @memset(from_ptr[patch_end_index..total_size], int3);
     }
 }
 
