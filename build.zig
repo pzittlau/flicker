@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) !void {
         .root_module = mod,
     });
     exe.pie = true;
+    exe.lto = if (optimize == .Debug) .none else .full;
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
