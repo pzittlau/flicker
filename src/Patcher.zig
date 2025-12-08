@@ -351,7 +351,7 @@ fn attemptDirectOrPunning(
     // mapped. While harmless (it becomes an unused executable page), it is technically a
     // memory leak. A future fix should track "current attempt" pages separately and unmap
     // them on failure.
-    while (pii.next(&patcher.address_allocator)) |allocated_range| {
+    while (pii.next(&patcher.address_allocator, .exhaustive)) |allocated_range| {
         try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(allocated_range));
         patcher.ensureRangeWritable(
             allocated_range,
@@ -426,7 +426,7 @@ fn attemptSuccessorEviction(
         succ_request.size,
         succ_flicken.size(),
     );
-    while (succ_pii.next(&patcher.address_allocator)) |succ_range| {
+    while (succ_pii.next(&patcher.address_allocator, .greedy)) |succ_range| {
         // Ensure bytes match original before retry.
         assert(mem.eql(
             u8,
@@ -464,7 +464,7 @@ fn attemptSuccessorEviction(
             request.size,
             flicken.size(),
         );
-        while (orig_pii.next(&patcher.address_allocator)) |orig_range| {
+        while (orig_pii.next(&patcher.address_allocator, .greedy)) |orig_range| {
             if (succ_range.touches(orig_range)) continue;
             try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(orig_range));
             patcher.ensureRangeWritable(
@@ -566,7 +566,7 @@ fn attemptNeighborEviction(
                 patch_flicken.size(),
             );
 
-            while (patch_pii.next(&patcher.address_allocator)) |patch_range| {
+            while (patch_pii.next(&patcher.address_allocator, .greedy)) |patch_range| {
                 // J_Patch MUST NOT use prefixes, because it's punned inside J_Victim.
                 // Adding prefixes would shift J_Patch relative to J_Victim, making constraints harder.
                 if (patch_pii.num_prefixes > 0) break;
@@ -602,7 +602,7 @@ fn attemptNeighborEviction(
                     victim_flicken.size(),
                 );
 
-                while (victim_pii.next(&patcher.address_allocator)) |victim_range| {
+                while (victim_pii.next(&patcher.address_allocator, .greedy)) |victim_range| {
                     if (patch_range.touches(victim_range)) continue;
 
                     try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(victim_range));
@@ -874,9 +874,18 @@ const PatchInstructionIterator = struct {
         };
     }
 
+    pub const Strategy = enum {
+        /// Iterates through all possible ranges.
+        /// Useful for finding the optimal allocation (fewest prefixes).
+        exhaustive,
+        /// Try one allocation per found valid_range. Dramatically faster.
+        greedy,
+    };
+
     fn next(
         pii: *PatchInstructionIterator,
         address_allocator: *AddressAllocator,
+        strategy: Strategy,
     ) ?Range {
         const State = enum {
             allocation,
@@ -892,7 +901,10 @@ const PatchInstructionIterator = struct {
                     assert(allocated_range.size() == pii.flicken_size);
                     // Advancing the valid range, such that the next call to `findAllocation` won't
                     // find the same range again.
-                    pii.valid_range.start = allocated_range.start + 1;
+                    switch (strategy) {
+                        .exhaustive => pii.valid_range.start = allocated_range.start + 1,
+                        .greedy => pii.valid_range.start = pii.valid_range.end,
+                    }
                     return allocated_range;
                 } else {
                     continue :blk .range;
