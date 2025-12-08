@@ -55,7 +55,7 @@ pub fn touches(range: Range, other: Range) bool {
 pub fn compare(lhs: Range, rhs: Range) std.math.Order {
     assert(lhs.end >= lhs.start);
     assert(rhs.end >= rhs.start);
-    return if (lhs.start > rhs.end) .gt else if (lhs.end < rhs.start) .lt else .eq;
+    return if (lhs.start >= rhs.end) .gt else if (lhs.end <= rhs.start) .lt else .eq;
 }
 
 pub fn getStart(range: Range, T: type) T {
