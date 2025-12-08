@@ -623,18 +623,21 @@ fn attemptNeighborEviction(
                                 .old_addr = @intFromPtr(request.bytes.ptr),
                             };
                         }
-                        try commitTrampoline(
+                        commitTrampoline(
                             trampoline,
                             patch_flicken.bytes,
                             reloc_info,
                             @intFromPtr(request.bytes.ptr) + request.size,
-                        );
+                        ) catch |err| switch (err) {
+                            error.RelocationOverflow => continue,
+                            else => return err,
+                        };
                     }
 
                     // 2. Write Victim Trampoline (J_Victim target)
                     {
                         const trampoline: [*]u8 = @ptrFromInt(victim_range.getStart(u64));
-                        try commitTrampoline(
+                        commitTrampoline(
                             trampoline,
                             victim_orig_bytes[0..victim_size],
                             .{
@@ -642,7 +645,10 @@ fn attemptNeighborEviction(
                                 .old_addr = @intFromPtr(victim_bytes_all.ptr),
                             },
                             @intFromPtr(victim_bytes_all.ptr) + victim_size,
-                        );
+                        ) catch |err| switch (err) {
+                            error.RelocationOverflow => continue,
+                            else => return err,
+                        };
                     }
 
                     // 3. Write J_Victim (overwrites head of J_Patch which is fine)
