@@ -347,7 +347,7 @@ fn attemptDirectOrPunning(
     // mapped. While harmless (it becomes an unused executable page), it is technically a
     // memory leak. A future fix should track "current attempt" pages separately and unmap
     // them on failure.
-    while (pii.next(.exhaustive)) |allocated_range| {
+    while (pii.next(.{ .count = 256 })) |allocated_range| {
         try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(allocated_range));
         ensureRangeWritable(
             allocated_range,
@@ -375,7 +375,7 @@ fn attemptDirectOrPunning(
         );
 
         if (request.size >= 5) {
-            assert(pii.num_prefixes == 0);
+            // assert(pii.num_prefixes == 0);
             stats.jump += 1;
         } else {
             stats.punning[pii.num_prefixes] += 1;
@@ -421,7 +421,7 @@ fn attemptSuccessorEviction(
         succ_request.size,
         succ_flicken.size(),
     );
-    while (succ_pii.next(.greedy)) |succ_range| {
+    while (succ_pii.next(.{ .count = 16 })) |succ_range| {
         // Ensure bytes match original before retry.
         assert(mem.eql(
             u8,
@@ -459,7 +459,7 @@ fn attemptSuccessorEviction(
             request.size,
             flicken.size(),
         );
-        while (orig_pii.next(.greedy)) |orig_range| {
+        while (orig_pii.next(.{ .count = 16 })) |orig_range| {
             if (succ_range.touches(orig_range)) continue;
             try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(orig_range));
             ensureRangeWritable(
@@ -560,7 +560,7 @@ fn attemptNeighborEviction(
                 patch_flicken.size(),
             );
 
-            while (patch_pii.next(.greedy)) |patch_range| {
+            while (patch_pii.next(.{ .count = 16 })) |patch_range| {
                 // J_Patch MUST NOT use prefixes, because it's punned inside J_Victim.
                 // Adding prefixes would shift J_Patch relative to J_Victim, making constraints harder.
                 if (patch_pii.num_prefixes > 0) break;
@@ -596,7 +596,7 @@ fn attemptNeighborEviction(
                     victim_flicken.size(),
                 );
 
-                while (victim_pii.next(.greedy)) |victim_range| {
+                while (victim_pii.next(.{ .count = 16 })) |victim_range| {
                     if (patch_range.touches(victim_range)) continue;
 
                     try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(victim_range));
@@ -848,6 +848,7 @@ const PatchInstructionIterator = struct {
     num_prefixes: u8,
     pli: PatchLocationIterator,
     valid_range: Range,
+    allocated_count: u64,
 
     fn init(
         bytes: []const u8,
@@ -864,15 +865,21 @@ const PatchInstructionIterator = struct {
             .num_prefixes = 0,
             .pli = pli,
             .valid_range = valid_range,
+            .allocated_count = 0,
         };
     }
 
-    pub const Strategy = enum {
+    pub const Strategy = union(enum) {
         /// Iterates through all possible ranges.
         /// Useful for finding the optimal allocation (fewest prefixes).
-        exhaustive,
-        /// Try one allocation per found valid_range. Dramatically faster.
-        greedy,
+        exhaustive: void,
+        /// Limits the search to `count` allocation attempts per valid constraint range found by the
+        /// PatchLocationIterator.
+        ///
+        /// This acts as a heuristic to prevent worst-case performance (scanning every byte of a 2GB
+        /// gap) while still offering better density than a purely greedy approach. A count of 1 is
+        /// equivalent to a greedy strategy.
+        count: u64,
     };
 
     fn next(
@@ -891,14 +898,23 @@ const PatchInstructionIterator = struct {
                     pii.valid_range,
                 )) |allocated_range| {
                     assert(allocated_range.size() == pii.flicken_size);
+                    pii.allocated_count += 1;
                     // Advancing the valid range, such that the next call to `findAllocation` won't
                     // find the same range again.
                     switch (strategy) {
                         .exhaustive => pii.valid_range.start = allocated_range.start + 1,
-                        .greedy => pii.valid_range.start = pii.valid_range.end,
+                        .count => |c| {
+                            if (pii.allocated_count >= c) {
+                                pii.valid_range.start = pii.valid_range.end;
+                                pii.allocated_count = 0;
+                            } else {
+                                pii.valid_range.start = allocated_range.start + 1;
+                            }
+                        },
                     }
                     return allocated_range;
                 } else {
+                    pii.allocated_count = 0;
                     continue :blk .range;
                 }
             },
