@@ -17,15 +17,11 @@ const Range = @import("Range.zig");
 
 const assert = std.debug.assert;
 
-const page_size = 4096;
+const page_size = std.heap.pageSize();
 const jump_rel32: u8 = 0xe9;
 const jump_rel32_size = 5;
 const jump_rel8: u8 = 0xeb;
 const jump_rel8_size = 2;
-const max_ins_bytes = 15;
-// Based on the paper 'x86-64 Instruction Usage among C/C++ Applications' by 'Akshintala et al.'
-// it's '4.25' bytes, so 4 is good enough. (https://oscarlab.github.io/papers/instrpop-systor19.pdf)
-const avg_ins_bytes = 4;
 
 // TODO: Find an invalid instruction to use.
 // const invalid: u8 = 0xaa;
@@ -33,42 +29,43 @@ const int3: u8 = 0xcc;
 const nop: u8 = 0x90;
 
 // Prefixes for Padded Jumps (Tactic T1)
-const prefix_fs: u8 = 0x64;
-const prefix_gs: u8 = 0x65;
-const prefix_ss: u8 = 0x36;
-const prefixes = [_]u8{ prefix_fs, prefix_gs, prefix_ss };
+const prefixes = [_]u8{
+    // prefix_fs,
+    0x64,
+    // prefix_gs,
+    0x65,
+    // prefix_ss,
+    0x36,
+};
 
-const Patcher = @This();
-
-gpa: mem.Allocator,
-flicken: std.StringArrayHashMapUnmanaged(Flicken) = .empty,
-address_allocator: AddressAllocator = .empty,
+pub var gpa: mem.Allocator = undefined;
+pub var flicken_templates: std.StringArrayHashMapUnmanaged(Flicken) = .empty;
+pub var address_allocator: AddressAllocator = .empty;
 /// Tracks the base addresses of pages we have mmap'd for Flicken.
-allocated_pages: std.AutoHashMapUnmanaged(u64, void) = .empty,
+pub var allocated_pages: std.AutoHashMapUnmanaged(u64, void) = .empty;
 
-pub fn init(gpa: mem.Allocator) !Patcher {
-    var flicken: std.StringArrayHashMapUnmanaged(Flicken) = .empty;
-    try flicken.ensureTotalCapacity(gpa, 8);
-    flicken.putAssumeCapacity("nop", .{ .name = "nop", .bytes = &.{} });
-    return .{
-        .gpa = gpa,
-        .flicken = flicken,
-    };
+var init_once = std.once(initInner);
+pub fn init() void {
+    init_once.call();
 }
-
-pub fn deinit(patcher: *Patcher) void {
-    _ = patcher;
+fn initInner() void {
+    gpa = std.heap.page_allocator;
+    flicken_templates.ensureTotalCapacity(
+        std.heap.page_allocator,
+        page_size / @sizeOf(Flicken),
+    ) catch @panic("failed initializing patcher");
+    flicken_templates.putAssumeCapacity("nop", .{ .name = "nop", .bytes = &.{} });
 }
 
 /// Flicken name and bytes have to be valid for the lifetime it's used. If a trampoline with the
 /// name is already registered it gets overwritten.
 /// NOTE: The name "nop" is reserved and always has the ID 0.
-pub fn addFlicken(patcher: *Patcher, trampoline: Flicken) !FlickenId {
+pub fn addFlicken(trampoline: Flicken) !FlickenId {
     assert(!mem.eql(u8, "nop", trampoline.name));
-    try patcher.flicken.ensureUnusedCapacity(patcher.gpa, 1);
+    try flicken_templates.ensureUnusedCapacity(gpa, 1);
     errdefer comptime unreachable;
 
-    const gop = patcher.flicken.getOrPutAssumeCapacity(trampoline.name);
+    const gop = flicken_templates.getOrPutAssumeCapacity(trampoline.name);
     if (gop.found_existing) {
         log.warn("addTrampoline: Overwriting existing trampoline: {s}", .{trampoline.name});
     }
@@ -174,18 +171,18 @@ pub const Statistics = struct {
 ///
 /// The region is processed Back-to-Front to ensure that modifications (punning) only
 /// constrain instructions that have already been processed or are locked.
-pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
+pub fn patchRegion(region: []align(page_size) u8) !void {
     {
         // Block the region, such that we don't try to allocate there anymore.
         const start: i64 = @intCast(@intFromPtr(region.ptr));
-        try patcher.address_allocator.block(
-            patcher.gpa,
+        try address_allocator.block(
+            gpa,
             .{ .start = start, .end = start + @as(i64, @intCast(region.len)) },
             page_size,
         );
     }
 
-    var arena_impl = std.heap.ArenaAllocator.init(patcher.gpa);
+    var arena_impl = std.heap.ArenaAllocator.init(gpa);
     const arena = arena_impl.allocator();
     defer arena_impl.deinit();
 
@@ -239,7 +236,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
             }
             last_offset = request.offset;
 
-            if (@as(u64, @intFromEnum(request.flicken)) >= patcher.flicken.count()) {
+            if (@as(u64, @intFromEnum(request.flicken)) >= flicken_templates.count()) {
                 const fmt = dis.formatBytes(request.bytes[0..request.size]);
                 log.err(
                     "patchRegion: Usage of undefined flicken in request {f} for instruction: {s}",
@@ -274,7 +271,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
                 }
             }
 
-            if (try patcher.attemptDirectOrPunning(
+            if (try attemptDirectOrPunning(
                 request,
                 arena,
                 &locked_bytes,
@@ -284,7 +281,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
                 continue :requests;
             }
 
-            if (try patcher.attemptSuccessorEviction(
+            if (try attemptSuccessorEviction(
                 request,
                 arena,
                 &locked_bytes,
@@ -294,7 +291,7 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
                 continue :requests;
             }
 
-            if (try patcher.attemptNeighborEviction(
+            if (try attemptNeighborEviction(
                 request,
                 arena,
                 &locked_bytes,
@@ -328,7 +325,6 @@ pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
 }
 
 fn attemptDirectOrPunning(
-    patcher: *Patcher,
     request: PatchRequest,
     arena: mem.Allocator,
     locked_bytes: *std.DynamicBitSetUnmanaged,
@@ -338,7 +334,7 @@ fn attemptDirectOrPunning(
     const flicken: Flicken = if (request.flicken == .nop)
         .{ .name = "nop", .bytes = request.bytes[0..request.size] }
     else
-        patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
+        flicken_templates.entries.get(@intFromEnum(request.flicken)).value;
 
     var pii = PatchInstructionIterator.init(
         request.bytes,
@@ -351,9 +347,9 @@ fn attemptDirectOrPunning(
     // mapped. While harmless (it becomes an unused executable page), it is technically a
     // memory leak. A future fix should track "current attempt" pages separately and unmap
     // them on failure.
-    while (pii.next(&patcher.address_allocator, .exhaustive)) |allocated_range| {
+    while (pii.next(.exhaustive)) |allocated_range| {
         try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(allocated_range));
-        patcher.ensureRangeWritable(
+        ensureRangeWritable(
             allocated_range,
             pages_made_writable,
         ) catch |err| switch (err) {
@@ -371,7 +367,7 @@ fn attemptDirectOrPunning(
             else => return err,
         };
 
-        try patcher.address_allocator.block(patcher.gpa, allocated_range, 0);
+        try address_allocator.block(gpa, allocated_range, 0);
         const lock_size = jump_rel32_size + pii.num_prefixes;
         locked_bytes.setRangeValue(
             .{ .start = request.offset, .end = request.offset + lock_size },
@@ -390,7 +386,6 @@ fn attemptDirectOrPunning(
 }
 
 fn attemptSuccessorEviction(
-    patcher: *Patcher,
     request: PatchRequest,
     arena: mem.Allocator,
     locked_bytes: *std.DynamicBitSetUnmanaged,
@@ -426,7 +421,7 @@ fn attemptSuccessorEviction(
         succ_request.size,
         succ_flicken.size(),
     );
-    while (succ_pii.next(&patcher.address_allocator, .greedy)) |succ_range| {
+    while (succ_pii.next(.greedy)) |succ_range| {
         // Ensure bytes match original before retry.
         assert(mem.eql(
             u8,
@@ -435,7 +430,7 @@ fn attemptSuccessorEviction(
         ));
 
         try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(succ_range));
-        patcher.ensureRangeWritable(
+        ensureRangeWritable(
             succ_range,
             pages_made_writable,
         ) catch |err| switch (err) {
@@ -457,17 +452,17 @@ fn attemptSuccessorEviction(
         const flicken: Flicken = if (request.flicken == .nop)
             .{ .name = "nop", .bytes = request.bytes[0..request.size] }
         else
-            patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
+            flicken_templates.entries.get(@intFromEnum(request.flicken)).value;
 
         var orig_pii = PatchInstructionIterator.init(
             request.bytes,
             request.size,
             flicken.size(),
         );
-        while (orig_pii.next(&patcher.address_allocator, .greedy)) |orig_range| {
+        while (orig_pii.next(.greedy)) |orig_range| {
             if (succ_range.touches(orig_range)) continue;
             try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(orig_range));
-            patcher.ensureRangeWritable(
+            ensureRangeWritable(
                 orig_range,
                 pages_made_writable,
             ) catch |err| switch (err) {
@@ -485,8 +480,8 @@ fn attemptSuccessorEviction(
                 else => return err,
             };
 
-            try patcher.address_allocator.block(patcher.gpa, succ_range, 0);
-            try patcher.address_allocator.block(patcher.gpa, orig_range, 0);
+            try address_allocator.block(gpa, succ_range, 0);
+            try address_allocator.block(gpa, orig_range, 0);
             const lock_size = request.size + jump_rel32_size + succ_pii.num_prefixes;
             locked_bytes.setRangeValue(
                 .{ .start = request.offset, .end = request.offset + lock_size },
@@ -506,7 +501,6 @@ fn attemptSuccessorEviction(
 }
 
 fn attemptNeighborEviction(
-    patcher: *Patcher,
     request: PatchRequest,
     arena: mem.Allocator,
     locked_bytes: *std.DynamicBitSetUnmanaged,
@@ -555,7 +549,7 @@ fn attemptNeighborEviction(
             const patch_flicken: Flicken = if (request.flicken == .nop)
                 .{ .name = "nop", .bytes = request.bytes[0..request.size] }
             else
-                patcher.flicken.entries.get(@intFromEnum(request.flicken)).value;
+                flicken_templates.entries.get(@intFromEnum(request.flicken)).value;
 
             // Constraints for J_Patch:
             // Bytes [0 .. victim_size - k] are free (inside victim).
@@ -566,13 +560,13 @@ fn attemptNeighborEviction(
                 patch_flicken.size(),
             );
 
-            while (patch_pii.next(&patcher.address_allocator, .greedy)) |patch_range| {
+            while (patch_pii.next(.greedy)) |patch_range| {
                 // J_Patch MUST NOT use prefixes, because it's punned inside J_Victim.
                 // Adding prefixes would shift J_Patch relative to J_Victim, making constraints harder.
                 if (patch_pii.num_prefixes > 0) break;
 
                 try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(patch_range));
-                patcher.ensureRangeWritable(patch_range, pages_made_writable) catch |err| switch (err) {
+                ensureRangeWritable(patch_range, pages_made_writable) catch |err| switch (err) {
                     error.MappingAlreadyExists => continue,
                     else => return err,
                 };
@@ -602,11 +596,11 @@ fn attemptNeighborEviction(
                     victim_flicken.size(),
                 );
 
-                while (victim_pii.next(&patcher.address_allocator, .greedy)) |victim_range| {
+                while (victim_pii.next(.greedy)) |victim_range| {
                     if (patch_range.touches(victim_range)) continue;
 
                     try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(victim_range));
-                    patcher.ensureRangeWritable(victim_range, pages_made_writable) catch |err| switch (err) {
+                    ensureRangeWritable(victim_range, pages_made_writable) catch |err| switch (err) {
                         error.MappingAlreadyExists => continue,
                         else => return err,
                     };
@@ -667,8 +661,8 @@ fn attemptNeighborEviction(
                     }
 
                     // 5. Locking
-                    try patcher.address_allocator.block(patcher.gpa, patch_range, 0);
-                    try patcher.address_allocator.block(patcher.gpa, victim_range, 0);
+                    try address_allocator.block(gpa, patch_range, 0);
+                    try address_allocator.block(gpa, victim_range, 0);
 
                     locked_bytes.setRangeValue(
                         .{ .start = request.offset, .end = request.offset + request.size },
@@ -800,7 +794,6 @@ fn touchedPageCount(range: Range) u32 {
 
 /// Ensure `range` is mapped R|W. Assumes `pages_made_writable` has enough free capacity.
 fn ensureRangeWritable(
-    patcher: *Patcher,
     range: Range,
     pages_made_writable: *std.AutoHashMapUnmanaged(u64, void),
 ) !void {
@@ -812,7 +805,7 @@ fn ensureRangeWritable(
         // If the page is already writable, skip it.
         if (pages_made_writable.get(page_addr)) |_| continue;
         // If we mapped it already we have to do mprotect, else mmap.
-        const gop = try patcher.allocated_pages.getOrPut(patcher.gpa, page_addr);
+        const gop = try allocated_pages.getOrPut(gpa, page_addr);
         if (gop.found_existing) {
             const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr);
             try posix.mprotect(ptr[0..page_addr], protection);
@@ -830,8 +823,8 @@ fn ensureRangeWritable(
                     // (executable, OS, dynamic loader,...) allocated something there.
                     // We block this so we don't try this page again in the future,
                     // saving a bunch of syscalls.
-                    try patcher.address_allocator.block(
-                        patcher.gpa,
+                    try address_allocator.block(
+                        gpa,
                         .{ .start = @intCast(page_addr), .end = @intCast(page_addr + page_size) },
                         page_size,
                     );
@@ -884,7 +877,6 @@ const PatchInstructionIterator = struct {
 
     fn next(
         pii: *PatchInstructionIterator,
-        address_allocator: *AddressAllocator,
         strategy: Strategy,
     ) ?Range {
         const State = enum {

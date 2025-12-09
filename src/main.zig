@@ -32,8 +32,6 @@ const help =
 
 const UnfinishedReadError = error{UnfinishedRead};
 
-var patcher: Patcher = undefined;
-
 pub fn main() !void {
     // Parse arguments
     var arg_index: u64 = 1; // Skip own name
@@ -52,10 +50,10 @@ pub fn main() !void {
     }
 
     // Initialize patcher
-    patcher = try Patcher.init(std.heap.page_allocator); // TODO: allocator
+    Patcher.init();
     // Block the first 64k to avoid mmap_min_addr (EPERM) issues on Linux.
     // TODO: read it from `/proc/sys/vm/mmap_min_addr` instead.
-    try patcher.address_allocator.block(patcher.gpa, .{ .start = 0, .end = 0x10000 }, 0);
+    try Patcher.address_allocator.block(Patcher.gpa, .{ .start = 0, .end = 0x10000 }, 0);
 
     // Map file into memory
     const file = try lookupFile(mem.sliceTo(std.os.argv[arg_index], 0));
@@ -207,7 +205,7 @@ fn loadStaticElf(ehdr: elf.Header, file_reader: *std.fs.File.Reader) !usize {
         const protections = elfToMmapProt(phdr.p_flags);
         if (protections & posix.PROT.EXEC > 0) {
             log.info("Patching executable segment", .{});
-            try patcher.patchRegion(ptr);
+            try Patcher.patchRegion(ptr);
         }
         try posix.mprotect(ptr, protections);
     }
