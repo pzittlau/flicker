@@ -6,6 +6,7 @@ const mem = std.mem;
 const posix = std.posix;
 const zydis = @import("zydis").zydis;
 const dis = @import("disassembler.zig");
+const syscalls = @import("syscalls.zig");
 
 const log = std.log.scoped(.patcher);
 const AddressAllocator = @import("AddressAllocator.zig");
@@ -38,11 +39,18 @@ const prefixes = [_]u8{
     0x36,
 };
 
+var syscall_flicken_bytes = [13]u8{
+    0x49, 0xBB, // mov r11
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, // 8byte immediate
+    0x41, 0xff, 0xd3, // call r11
+};
+
 pub var gpa: mem.Allocator = undefined;
 pub var flicken_templates: std.StringArrayHashMapUnmanaged(Flicken) = .empty;
 pub var address_allocator: AddressAllocator = .empty;
 /// Tracks the base addresses of pages we have mmap'd for Flicken.
 pub var allocated_pages: std.AutoHashMapUnmanaged(u64, void) = .empty;
+pub var mutex: std.Thread.Mutex = .{};
 
 var init_once = std.once(initInner);
 pub fn init() void {
@@ -55,6 +63,8 @@ fn initInner() void {
         page_size / @sizeOf(Flicken),
     ) catch @panic("failed initializing patcher");
     flicken_templates.putAssumeCapacity("nop", .{ .name = "nop", .bytes = &.{} });
+    mem.writeInt(u64, syscall_flicken_bytes[2..][0..8], @intFromPtr(&syscalls.syscall_entry), .little);
+    flicken_templates.putAssumeCapacity("syscall", .{ .name = "syscall", .bytes = &syscall_flicken_bytes });
 }
 
 /// Flicken name and bytes have to be valid for the lifetime it's used. If a trampoline with the
@@ -62,6 +72,7 @@ fn initInner() void {
 /// NOTE: The name "nop" is reserved and always has the ID 0.
 pub fn addFlicken(trampoline: Flicken) !FlickenId {
     assert(!mem.eql(u8, "nop", trampoline.name));
+    assert(!mem.eql(u8, "syscall", trampoline.name));
     try flicken_templates.ensureUnusedCapacity(gpa, 1);
     errdefer comptime unreachable;
 
@@ -90,6 +101,8 @@ pub const FlickenId = enum(u64) {
     /// It also needs special handling when constructing the patches, because it's different for
     /// each instruction.
     nop = 0,
+    /// TODO: docs
+    syscall = 1,
     _,
 };
 
@@ -172,6 +185,11 @@ pub const Statistics = struct {
 /// The region is processed Back-to-Front to ensure that modifications (punning) only
 /// constrain instructions that have already been processed or are locked.
 pub fn patchRegion(region: []align(page_size) u8) !void {
+    // For now just do a coarse lock.
+    // TODO: should we make this more fine grained?
+    mutex.lock();
+    defer mutex.unlock();
+
     {
         // Block the region, such that we don't try to allocate there anymore.
         const start: i64 = @intCast(@intFromPtr(region.ptr));
@@ -202,11 +220,12 @@ pub fn patchRegion(region: []align(page_size) u8) !void {
             const offset = instruction.address - @intFromPtr(region.ptr);
             instruction_starts.set(offset);
 
-            const should_patch = instruction.instruction.mnemonic == zydis.ZYDIS_MNEMONIC_SYSCALL or
+            const is_syscall = instruction.instruction.mnemonic == zydis.ZYDIS_MNEMONIC_SYSCALL;
+            const should_patch = is_syscall or
                 instruction.instruction.attributes & zydis.ZYDIS_ATTRIB_HAS_LOCK > 0;
             if (should_patch) {
                 const request: PatchRequest = .{
-                    .flicken = .nop,
+                    .flicken = if (is_syscall) .syscall else .nop,
                     .offset = offset,
                     .size = instruction.instruction.length,
                     .bytes = region[offset..],
