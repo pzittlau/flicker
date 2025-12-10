@@ -52,9 +52,6 @@ export fn syscall_handler(regs: *UserRegs) void {
 /// Assembly trampoline that saves state and calls the Zig handler.
 pub fn syscall_entry() callconv(.naked) void {
     asm volatile (
-        \\ .global syscall_entry
-        \\ .type syscall_entry, @function
-        \\ syscall_entry:
         \\     # Respect the Red Zone (128 bytes)
         \\     sub $128, %rsp
         \\
