@@ -109,5 +109,9 @@ pub fn syscall_entry() callconv(.naked) void {
         \\     # Restore Red Zone and Return
         \\     add $128, %rsp
         \\     ret
+        :
+        // TODO: can we somehow use %[handler] in the assembly instead?
+        // Right now this is just here such that lto does not discard the `syscall_handler` function
+        : [handler] "i" (syscall_handler),
     );
 }
