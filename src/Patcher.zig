@@ -52,19 +52,35 @@ pub var address_allocator: AddressAllocator = .empty;
 pub var allocated_pages: std.AutoHashMapUnmanaged(u64, void) = .empty;
 pub var mutex: std.Thread.Mutex = .{};
 
-var init_once = std.once(initInner);
-pub fn init() void {
-    init_once.call();
-}
-fn initInner() void {
+/// Initialize the patcher.
+/// NOTE: This should only be called **once**.
+pub fn init() !void {
     gpa = std.heap.page_allocator;
-    flicken_templates.ensureTotalCapacity(
+
+    try flicken_templates.ensureTotalCapacity(
         std.heap.page_allocator,
         page_size / @sizeOf(Flicken),
-    ) catch @panic("failed initializing patcher");
+    );
     flicken_templates.putAssumeCapacity("nop", .{ .name = "nop", .bytes = &.{} });
     mem.writeInt(u64, syscall_flicken_bytes[2..][0..8], @intFromPtr(&syscalls.syscall_entry), .little);
     flicken_templates.putAssumeCapacity("syscall", .{ .name = "syscall", .bytes = &syscall_flicken_bytes });
+
+    {
+        // Read mmap_min_addr to block the low memory range. This prevents us from allocating
+        // trampolines in the forbidden low address range.
+        var min_addr: u64 = 0x10000; // Default safe fallback (64KB)
+        if (std.fs.openFileAbsolute("/proc/sys/vm/mmap_min_addr", .{})) |file| {
+            defer file.close();
+            var buf: [32]u8 = undefined;
+            if (file.readAll(&buf)) |len| {
+                const trimmed = std.mem.trim(u8, buf[0..len], " \n\r\t");
+                if (std.fmt.parseInt(u64, trimmed, 10)) |val| {
+                    min_addr = val;
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+        try address_allocator.block(gpa, .{ .start = 0, .end = @intCast(min_addr) }, 0);
+    }
 }
 
 /// Flicken name and bytes have to be valid for the lifetime it's used. If a trampoline with the
