@@ -1,5 +1,6 @@
 const std = @import("std");
 const linux = std.os.linux;
+const Patcher = @import("Patcher.zig");
 
 /// Represents the stack layout pushed by `syscall_entry` before calling the handler.
 pub const UserRegs = extern struct {
@@ -40,6 +41,31 @@ export fn syscall_handler(regs: *UserRegs) void {
     const arg5 = regs.r8;
     const arg6 = regs.r9;
 
+    switch (sys) {
+        .readlink => {
+            // readlink(const char *path, char *buf, size_t bufsiz)
+            const path_ptr = @as([*:0]const u8, @ptrFromInt(regs.rdi));
+            // TODO: handle relative paths with cwd
+            if (isProcSelfExe(path_ptr)) {
+                handleReadlink(regs.rsi, regs.rdx, regs);
+                return;
+            }
+        },
+        .readlinkat => {
+            // readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
+            // We only intercept if pathname is absolute "/proc/self/exe".
+            // TODO: handle relative paths with dirfd pointing to /proc/self
+            // TODO: handle relative paths with dirfd == AT_FDCWD (like readlink)
+            // TODO: handle empty pathname
+            const path_ptr = @as([*:0]const u8, @ptrFromInt(regs.rsi));
+            if (isProcSelfExe(path_ptr)) {
+                handleReadlink(regs.rdx, regs.r10, regs);
+                return;
+            }
+        },
+        else => {},
+    }
+
     std.debug.print("Got syscall {s}\n", .{@tagName(sys)});
     // For now, we just pass through everything.
     // In the future, we will switch on `sys` to handle mmap, mprotect, etc.
@@ -47,6 +73,25 @@ export fn syscall_handler(regs: *UserRegs) void {
 
     // Write result back to the saved RAX so it is restored to the application.
     regs.rax = result;
+}
+
+fn isProcSelfExe(path: [*:0]const u8) bool {
+    const needle = "/proc/self/exe";
+    var i: usize = 0;
+    while (i < needle.len) : (i += 1) {
+        if (path[i] != needle[i]) return false;
+    }
+    return path[i] == 0;
+}
+
+fn handleReadlink(buf_addr: u64, buf_size: u64, regs: *UserRegs) void {
+    const target = Patcher.target_exec_path;
+    const len = @min(target.len, buf_size);
+    const dest = @as([*]u8, @ptrFromInt(buf_addr));
+    @memcpy(dest[0..len], target[0..len]);
+
+    // readlink does not null-terminate if the buffer is full, it just returns length.
+    regs.rax = len;
 }
 
 /// Assembly trampoline that saves state and calls the Zig handler.

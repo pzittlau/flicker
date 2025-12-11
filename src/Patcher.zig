@@ -52,6 +52,9 @@ pub var address_allocator: AddressAllocator = .empty;
 pub var allocated_pages: std.AutoHashMapUnmanaged(u64, void) = .empty;
 pub var mutex: std.Thread.Mutex = .{};
 
+pub var target_exec_path_buf: [std.fs.max_path_bytes]u8 = @splat(0);
+pub var target_exec_path: []const u8 = undefined;
+
 /// Initialize the patcher.
 /// NOTE: This should only be called **once**.
 pub fn init() !void {

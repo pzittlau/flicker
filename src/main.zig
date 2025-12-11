@@ -49,11 +49,21 @@ pub fn main() !void {
         return;
     }
 
-    // Initialize patcher
-    try Patcher.init();
+    const file = try lookupFile(mem.sliceTo(std.os.argv[arg_index], 0));
+
+    {
+        // Initialize patcher
+        try Patcher.init();
+        // Resolve the absolute path of the target executable. This is needed for the
+        // readlink("/proc/self/exe") interception. We use the file descriptor to get the
+        // authoritative path.
+        var self_buf: [128]u8 = undefined;
+        const fd_path = try std.fmt.bufPrint(&self_buf, "/proc/self/fd/{d}", .{file.handle});
+        Patcher.target_exec_path = try std.fs.readLinkAbsolute(fd_path, &Patcher.target_exec_path_buf);
+        log.debug("Resolved target executable path: {s}", .{Patcher.target_exec_path});
+    }
 
     // Map file into memory
-    const file = try lookupFile(mem.sliceTo(std.os.argv[arg_index], 0));
     var file_buffer: [128]u8 = undefined;
     var file_reader = file.reader(&file_buffer);
     log.info("--- Loading executable: {s} ---", .{std.os.argv[arg_index]});
