@@ -326,6 +326,19 @@ test "nolibc_pie_readlink" {
 //     try testReadlink("libc_pie_readlink");
 // }
 
+test "nolibc_nopie_clone_raw" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_nopie_clone_raw") },
+        "Child: Hello\nParent: Goodbye\n",
+    );
+}
+test "nolibc_pie_clone_raw" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_pie_clone_raw") },
+        "Child: Hello\nParent: Goodbye\n",
+    );
+}
+
 test "echo" {
     try testHelper(&.{ "echo", "Hello", "There" }, "Hello There\n");
 }
