@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) !void {
     const exe = b.addExecutable(.{
         .name = "flicker",
         .root_module = mod,
+        .use_llvm = true,
     });
     exe.pie = true;
     exe.lto = if (optimize == .Debug) .none else .full;
