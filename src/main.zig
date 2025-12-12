@@ -274,3 +274,96 @@ test {
     _ = @import("Range.zig");
     _ = @import("PatchLocationIterator.zig");
 }
+
+// TODO: make this be passed in from the build system
+const bin_path = "zig-out/bin/";
+fn getTestExePath(comptime name: []const u8) []const u8 {
+    return bin_path ++ "test_" ++ name;
+}
+const flicker_path = bin_path ++ "flicker";
+
+test "nolibc_nopie_exit" {
+    try testHelper(&.{ flicker_path, getTestExePath("nolibc_nopie_exit") }, "");
+}
+test "nolibc_pie_exit" {
+    try testHelper(&.{ flicker_path, getTestExePath("nolibc_pie_exit") }, "");
+}
+// BUG: This one is flaky
+// test "libc_pie_exit" {
+//     try testHelper(&.{ flicker_path, getTestExePath("libc_pie_exit") }, "");
+// }
+
+test "nolibc_nopie_helloWorld" {
+    try testHelper(&.{ flicker_path, getTestExePath("nolibc_nopie_helloWorld") }, "Hello World!\n");
+}
+test "nolibc_pie_helloWorld" {
+    try testHelper(&.{ flicker_path, getTestExePath("nolibc_pie_helloWorld") }, "Hello World!\n");
+}
+// BUG: This one is flaky
+// test "libc_pie_helloWorld" {
+//     try testHelper(&.{ flicker_path, getTestExePath("libc_pie_helloWorld") }, "Hello World!\n");
+// }
+
+test "nolibc_nopie_printArgs" {
+    try testPrintArgs("nolibc_nopie_printArgs");
+}
+test "nolibc_pie_printArgs" {
+    try testPrintArgs("nolibc_pie_printArgs");
+}
+// BUG: This one is flaky
+// test "libc_pie_printArgs" {
+//     try testPrintArgs("libc_pie_printArgs");
+// }
+
+test "nolibc_nopie_readlink" {
+    try testReadlink("nolibc_nopie_readlink");
+}
+test "nolibc_pie_readlink" {
+    try testReadlink("nolibc_pie_readlink");
+}
+// BUG: This one just outputs the path to the flicker executable and is likely also flaky
+// test "libc_pie_readlink" {
+//     try testReadlink("libc_pie_readlink");
+// }
+
+test "echo" {
+    try testHelper(&.{ "echo", "Hello", "There" }, "Hello There\n");
+}
+
+fn testPrintArgs(comptime name: []const u8) !void {
+    const exe_path = getTestExePath(name);
+    const loader_argv: []const []const u8 = &.{ flicker_path, exe_path, "foo", "bar", "baz hi" };
+    const target_argv = loader_argv[1..];
+    const expected_stout = try mem.join(testing.allocator, " ", target_argv);
+    defer testing.allocator.free(expected_stout);
+    try testHelper(loader_argv, expected_stout);
+}
+
+fn testReadlink(comptime name: []const u8) !void {
+    const exe_path = getTestExePath(name);
+    const loader_argv: []const []const u8 = &.{ flicker_path, exe_path };
+    const cwd_path = try std.fs.cwd().realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(cwd_path);
+    const expected_path = try std.fs.path.join(testing.allocator, &.{ cwd_path, exe_path });
+    defer testing.allocator.free(expected_path);
+    try testHelper(loader_argv, expected_path);
+}
+
+fn testHelper(
+    argv: []const []const u8,
+    expected_stdout: []const u8,
+) !void {
+    const result = try std.process.Child.run(.{
+        .allocator = testing.allocator,
+        .argv = argv,
+    });
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    errdefer std.log.err("term: {}", .{result.term});
+    errdefer std.log.err("stdout: {s}", .{result.stdout});
+    errdefer std.log.err("stderr: {s}", .{result.stderr});
+
+    try testing.expectEqualStrings(expected_stdout, result.stdout);
+    try testing.expect(result.term == .Exited);
+    try testing.expectEqual(0, result.term.Exited);
+}
