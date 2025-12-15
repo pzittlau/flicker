@@ -21,6 +21,9 @@ pub const UserRegs = extern struct {
     r13: u64,
     r14: u64,
     r15: u64,
+    /// This one isn't pushed on the stack by `syscall_entry`. It's pushed by the `call r11` to get
+    /// to the `syscall_entry`
+    return_address: u64,
 };
 
 /// The main entry point for intercepted syscalls.
@@ -124,7 +127,6 @@ pub fn syscall_entry() callconv(.naked) void {
         \\     push %rbx
         \\     push %rax
         \\     pushfq # Save Flags
-        \\     # TODO: save return_address
         \\
         \\     # Align stack
         \\     # Current pushes: 16 * 8 = 128 bytes.
