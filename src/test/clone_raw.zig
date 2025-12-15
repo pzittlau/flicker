@@ -51,9 +51,12 @@ pub fn main() !void {
         : .{ .rcx = true, .r11 = true, .memory = true });
 
     // Parent Process
-    const child_pid: i32 = @intCast(ret);
+    const child_pid: i64 = @bitCast(ret);
     if (child_pid < 0) {
-        _ = linux.syscall3(.write, 1, @intFromPtr("Parent: Clone failed\n"), 21);
+        std.debug.print(
+            "Parent: Clone failed with: {}\n",
+            .{@as(linux.E, @enumFromInt(-child_pid))},
+        );
         return;
     }
 

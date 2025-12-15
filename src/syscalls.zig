@@ -60,6 +60,7 @@ export fn syscall_handler(regs: *UserRegs) callconv(.c) void {
         },
         .clone, .clone3 => {
             handleClone(regs);
+            std.debug.print("back in `syscall_handler`\n", .{});
             return;
         },
         .fork, .vfork => {
@@ -201,7 +202,7 @@ const CloneArgs = extern struct {
 
 fn handleClone(regs: *UserRegs) void {
     const sys: linux.syscalls.X64 = @enumFromInt(regs.rax);
-    std.debug.print("got: {}\n", .{sys});
+    std.debug.print("got: {}, Parent PID: \t{}\n", .{ sys, linux.getpid() });
     var child_stack: u64 = 0;
 
     // Determine stack
@@ -215,7 +216,6 @@ fn handleClone(regs: *UserRegs) void {
             child_stack = args.stack + args.stack_size;
         }
     }
-    std.debug.print("child_stack: {x}\n", .{child_stack});
 
     // If no new stack, just execute (like fork)
     if (child_stack == 0) {
@@ -229,14 +229,101 @@ fn handleClone(regs: *UserRegs) void {
         return;
     }
 
-    @panic("case with a different stack is not handled yet");
+    // Prepare child stack by copying UserRegs and return_address onto it.
+    // TODO: test alignment
+    child_stack &= ~@as(u64, 0xf - 1); // align to 16 bytes
+    const child_regs_addr = child_stack - @sizeOf(UserRegs);
+    const child_regs = @as(*UserRegs, @ptrFromInt(child_regs_addr));
+    child_regs.* = regs.*;
+    child_regs.rax = 0;
+
+    // Prepare arguments for syscall
+    var new_rsi = regs.rsi;
+    var new_rdi = regs.rdi;
+    var clone3_args_copy: CloneArgs = undefined;
+
+    if (sys == .clone) {
+        new_rsi = child_regs_addr;
+    } else {
+        const args = @as(*const CloneArgs, @ptrFromInt(regs.rdi));
+        clone3_args_copy = args.*;
+        clone3_args_copy.stack = child_regs_addr;
+        clone3_args_copy.stack_size = 0; // TODO:
+        new_rdi = @intFromPtr(&clone3_args_copy);
+    }
+
+    const msg = "Child: This is a debug message from within handleClone\n";
+
+    // Execute clone/clone3 via inline assembly
+    // We handle the child path entirely in assembly to avoid stack frame issues.
+    const ret = asm volatile (
+        \\ syscall
+        \\ test %rax, %rax
+        \\ jnz 1f
+        \\
+        \\ # --- CHILD PATH ---
+        \\ # We are now on the new stack and %rsp points to child_regs_addr
+        \\  
+        \\ # Let's do a debug print
+        \\ # Write to stdout
+        \\ mov $2, %%rdi        # fd = 2 (stderr)
+        \\ mov %[msg], %%rsi    # buffer
+        \\ mov %[len], %%rdx    # length
+        \\ mov $1, %%rax        # SYS_write
+        \\ syscall
+        \\
+        \\ # Run Child Hook
+        \\ # Argument 1 (rdi): Pointer to UserRegs (which is current rsp)
+        \\ mov %rsp, %rdi
+        \\ call postCloneChild
+        \\
+        \\ # Restore Context
+        \\ add $8, %rsp      # Skip padding
+        \\ popfq
+        \\ pop %rax
+        \\ pop %rbx
+        \\ pop %rcx
+        \\ pop %rdx
+        \\ pop %rsi
+        \\ pop %rdi
+        \\ pop %rbp
+        \\ pop %r8
+        \\ pop %r9
+        \\ pop %r10
+        \\ pop %r11
+        \\ pop %r12
+        \\ pop %r13
+        \\ pop %r14
+        \\ pop %r15
+        \\
+        \\ # Jump back to the trampoline
+        \\ ret
+        \\
+        \\ 1:
+        \\ # --- PARENT PATH ---
+        : [ret] "={rax}" (-> usize),
+        : [number] "{rax}" (regs.rax),
+          [arg1] "{rdi}" (new_rdi),
+          [arg2] "{rsi}" (new_rsi),
+          [arg3] "{rdx}" (regs.rdx),
+          [arg4] "{r10}" (regs.r10),
+          [arg5] "{r8}" (regs.r8),
+          [arg6] "{r9}" (regs.r9),
+          [child_hook] "i" (postCloneChild),
+          [msg] "r" (msg.ptr),
+          [len] "r" (msg.len),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+
+    // Parent continues here
+    regs.rax = ret;
+    postCloneParent(regs);
 }
 
-fn postCloneChild(regs: *UserRegs) void {
+export fn postCloneChild(regs: *UserRegs) callconv(.c) void {
     _ = regs;
     std.debug.print("Child: post clone\n", .{});
 }
 
 fn postCloneParent(regs: *UserRegs) void {
-    std.debug.print("Parent: post clone; Child PID: {}\n", .{regs.rax});
+    std.debug.print("Parent: post clone; Child PID: \t{}\n", .{regs.rax});
 }
