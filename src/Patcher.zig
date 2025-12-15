@@ -71,7 +71,7 @@ pub fn init() !void {
     mem.writeInt(
         u64,
         syscall_flicken_bytes[2..][0..8],
-        @intFromPtr(&syscalls.syscall_entry),
+        @intFromPtr(&syscalls.syscallEntry),
         .little,
     );
     flicken_templates.putAssumeCapacity("syscall", .{ .name = "syscall", .bytes = &syscall_flicken_bytes });
