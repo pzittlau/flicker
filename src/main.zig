@@ -356,6 +356,25 @@ test "echo" {
     try testHelper(&.{ "echo", "Hello", "There" }, "Hello There\n");
 }
 
+test "nolibc_nopie_fork" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_nopie_fork") },
+        "Child: I'm alive!\nParent: Child died.\n",
+    );
+}
+test "nolibc_pie_fork" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_pie_fork") },
+        "Child: I'm alive!\nParent: Child died.\n",
+    );
+}
+test "libc_pie_fork" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("libc_pie_fork") },
+        "Child: I'm alive!\nParent: Child died.\n",
+    );
+}
+
 fn testPrintArgs(comptime name: []const u8) !void {
     const exe_path = getTestExePath(name);
     const loader_argv: []const []const u8 = &.{ flicker_path, exe_path, "foo", "bar", "baz hi" };

@@ -63,10 +63,6 @@ export fn syscall_handler(regs: *UserRegs) callconv(.c) void {
             std.debug.print("back in `syscall_handler`\n", .{});
             return;
         },
-        .fork, .vfork => {
-            // fork/vfork duplicate the stack (or share it until exec), so the return path via
-            // syscall_entry works fine.
-        },
         .rt_sigreturn => {
             @panic("sigreturn is not supported yet");
         },
