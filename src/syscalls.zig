@@ -1,6 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const Patcher = @import("Patcher.zig");
+const assert = std.debug.assert;
 
 /// Represents the stack layout pushed by `syscall_entry` before calling the handler.
 pub const UserRegs = extern struct {
@@ -32,8 +33,6 @@ pub const UserRegs = extern struct {
 /// It effectively emulates the syscall instruction while allowing for interception.
 export fn syscall_handler(regs: *UserRegs) callconv(.c) void {
     // TODO: Handle signals (masking) to prevent re-entrancy issues if we touch global state.
-    // TODO: Handle `clone` specially because the child thread wakes up with a fresh stack
-    //       and cannot pop the registers we saved here.
 
     const sys: linux.SYS = @enumFromInt(regs.rax);
 
@@ -60,7 +59,8 @@ export fn syscall_handler(regs: *UserRegs) callconv(.c) void {
             }
         },
         .clone, .clone3 => {
-            @panic("Clone is not supported yet");
+            handleClone(regs);
+            return;
         },
         .fork, .vfork => {
             // fork/vfork duplicate the stack (or share it until exec), so the return path via
@@ -183,4 +183,60 @@ fn handleReadlink(buf_addr: u64, buf_size: u64, regs: *UserRegs) void {
 
     // readlink does not null-terminate if the buffer is full, it just returns length.
     regs.rax = len;
+}
+
+const CloneArgs = extern struct {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+    set_tid: u64,
+    set_tid_size: u64,
+    cgroup: u64,
+};
+
+fn handleClone(regs: *UserRegs) void {
+    const sys: linux.syscalls.X64 = @enumFromInt(regs.rax);
+    std.debug.print("got: {}\n", .{sys});
+    var child_stack: u64 = 0;
+
+    // Determine stack
+    if (sys == .clone) {
+        // clone(flags, stack, ...)
+        child_stack = regs.rsi;
+    } else {
+        // clone3(struct clone_args *args, size_t size)
+        const args = @as(*const CloneArgs, @ptrFromInt(regs.rdi));
+        if (args.stack != 0) {
+            child_stack = args.stack + args.stack_size;
+        }
+    }
+    std.debug.print("child_stack: {x}\n", .{child_stack});
+
+    // If no new stack, just execute (like fork)
+    if (child_stack == 0) {
+        regs.rax = executeSyscall(regs);
+        if (regs.rax == 0) {
+            postCloneChild(regs);
+        } else {
+            assert(regs.rax > 0); // TODO:: error handling
+            postCloneParent(regs);
+        }
+        return;
+    }
+
+    @panic("case with a different stack is not handled yet");
+}
+
+fn postCloneChild(regs: *UserRegs) void {
+    _ = regs;
+    std.debug.print("Child: post clone\n", .{});
+}
+
+fn postCloneParent(regs: *UserRegs) void {
+    std.debug.print("Parent: post clone; Child PID: {}\n", .{regs.rax});
 }

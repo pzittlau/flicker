@@ -68,7 +68,12 @@ pub fn init() !void {
         page_size / @sizeOf(Flicken),
     );
     flicken_templates.putAssumeCapacity("nop", .{ .name = "nop", .bytes = &.{} });
-    mem.writeInt(u64, syscall_flicken_bytes[4..][0..8], @intFromPtr(&syscalls.syscall_entry), .little);
+    mem.writeInt(
+        u64,
+        syscall_flicken_bytes[2..][0..8],
+        @intFromPtr(&syscalls.syscall_entry),
+        .little,
+    );
     flicken_templates.putAssumeCapacity("syscall", .{ .name = "syscall", .bytes = &syscall_flicken_bytes });
 
     {

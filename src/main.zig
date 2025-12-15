@@ -339,6 +339,19 @@ test "nolibc_pie_clone_raw" {
     );
 }
 
+test "nolibc_nopie_clone_no_new_stack" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_nopie_clone_no_new_stack") },
+        "Child: Hello\nParent: Goodbye\n",
+    );
+}
+test "nolibc_pie_clone_no_new_stack" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_pie_clone_no_new_stack") },
+        "Child: Hello\nParent: Goodbye\n",
+    );
+}
+
 test "echo" {
     try testHelper(&.{ "echo", "Hello", "There" }, "Hello There\n");
 }
