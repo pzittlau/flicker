@@ -27,19 +27,12 @@ pub const UserRegs = extern struct {
 ///
 /// This function is called from `syscall_entry` with a pointer to the saved registers.
 /// It effectively emulates the syscall instruction while allowing for interception.
-export fn syscall_handler(regs: *UserRegs) void {
+export fn syscall_handler(regs: *UserRegs) callconv(.c) void {
     // TODO: Handle signals (masking) to prevent re-entrancy issues if we touch global state.
     // TODO: Handle `clone` specially because the child thread wakes up with a fresh stack
     //       and cannot pop the registers we saved here.
 
-    const sys_nr = regs.rax;
-    const sys: linux.SYS = @enumFromInt(sys_nr);
-    const arg1 = regs.rdi;
-    const arg2 = regs.rsi;
-    const arg3 = regs.rdx;
-    const arg4 = regs.r10;
-    const arg5 = regs.r8;
-    const arg6 = regs.r9;
+    const sys: linux.SYS = @enumFromInt(regs.rax);
 
     switch (sys) {
         .readlink => {
@@ -63,43 +56,57 @@ export fn syscall_handler(regs: *UserRegs) void {
                 return;
             }
         },
+        .clone, .clone3 => {
+            @panic("Clone is not supported yet");
+        },
+        .fork, .vfork => {
+            // fork/vfork duplicate the stack (or share it until exec), so the return path via
+            // syscall_entry works fine.
+        },
+        .rt_sigreturn => {
+            @panic("sigreturn is not supported yet");
+        },
+        .execve, .execveat => |s| {
+            // TODO: option to persist across new processes
+            std.debug.print("syscall {} called\n", .{s});
+        },
+        .prctl, .arch_prctl, .set_tid_address => |s| {
+            // TODO: what do we need to handle from these?
+            // process name
+            // fs base(gs?)
+            // thread id pointers
+            std.debug.print("syscall {} called\n", .{s});
+        },
+        .mmap, .mprotect => {
+            // TODO: JIT support
+            // TODO: cleanup
+        },
+        .munmap, .mremap => {
+            // TODO: cleanup
+        },
+
         else => {},
     }
 
-    std.debug.print("Got syscall {s}\n", .{@tagName(sys)});
-    // For now, we just pass through everything.
-    // In the future, we will switch on `sys` to handle mmap, mprotect, etc.
-    const result = std.os.linux.syscall6(sys, arg1, arg2, arg3, arg4, arg5, arg6);
-
     // Write result back to the saved RAX so it is restored to the application.
-    regs.rax = result;
+    regs.rax = executeSyscall(regs);
 }
 
-fn isProcSelfExe(path: [*:0]const u8) bool {
-    const needle = "/proc/self/exe";
-    var i: usize = 0;
-    while (i < needle.len) : (i += 1) {
-        if (path[i] != needle[i]) return false;
-    }
-    return path[i] == 0;
-}
-
-fn handleReadlink(buf_addr: u64, buf_size: u64, regs: *UserRegs) void {
-    const target = Patcher.target_exec_path;
-    const len = @min(target.len, buf_size);
-    const dest = @as([*]u8, @ptrFromInt(buf_addr));
-    @memcpy(dest[0..len], target[0..len]);
-
-    // readlink does not null-terminate if the buffer is full, it just returns length.
-    regs.rax = len;
+inline fn executeSyscall(regs: *UserRegs) u64 {
+    return linux.syscall6(
+        @enumFromInt(regs.rax),
+        regs.rdi,
+        regs.rsi,
+        regs.rdx,
+        regs.r10,
+        regs.r8,
+        regs.r9,
+    );
 }
 
 /// Assembly trampoline that saves state and calls the Zig handler.
 pub fn syscall_entry() callconv(.naked) void {
     asm volatile (
-        \\     # Respect the Red Zone (128 bytes)
-        \\     sub $128, %rsp
-        \\
         \\     # Save all GPRs that must be preserved or are arguments
         \\     push %r15
         \\     push %r14
@@ -117,6 +124,7 @@ pub fn syscall_entry() callconv(.naked) void {
         \\     push %rbx
         \\     push %rax
         \\     pushfq # Save Flags
+        \\     # TODO: save return_address
         \\
         \\     # Align stack
         \\     # Current pushes: 16 * 8 = 128 bytes.
@@ -148,12 +156,29 @@ pub fn syscall_entry() callconv(.naked) void {
         \\     pop %r14
         \\     pop %r15
         \\
-        \\     # Restore Red Zone and Return
-        \\     add $128, %rsp
         \\     ret
         :
         // TODO: can we somehow use %[handler] in the assembly instead?
         // Right now this is just here such that lto does not discard the `syscall_handler` function
         : [handler] "i" (syscall_handler),
     );
+}
+
+fn isProcSelfExe(path: [*:0]const u8) bool {
+    const needle = "/proc/self/exe";
+    var i: usize = 0;
+    while (i < needle.len) : (i += 1) {
+        if (path[i] != needle[i]) return false;
+    }
+    return path[i] == 0;
+}
+
+fn handleReadlink(buf_addr: u64, buf_size: u64, regs: *UserRegs) void {
+    const target = Patcher.target_exec_path;
+    const len = @min(target.len, buf_size);
+    const dest = @as([*]u8, @ptrFromInt(buf_addr));
+    @memcpy(dest[0..len], target[0..len]);
+
+    // readlink does not null-terminate if the buffer is full, it just returns length.
+    regs.rax = len;
 }

@@ -39,9 +39,12 @@ const prefixes = [_]u8{
     0x36,
 };
 
-var syscall_flicken_bytes = [13]u8{
-    0x49, 0xBB, // mov r11
-    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, // 8byte immediate
+/// As of the SysV ABI: 'The kernel destroys registers %rcx and %r11."
+/// So we put the address of the function to call into %r11.
+// TODO: Don't we need to save the red zone here, because we push the return address onto the stack
+// with the `call r11` instruction?
+var syscall_flicken_bytes = [_]u8{
+    0x49, 0xBB, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, // mov r11 <imm>
     0x41, 0xff, 0xd3, // call r11
 };
 
@@ -65,7 +68,7 @@ pub fn init() !void {
         page_size / @sizeOf(Flicken),
     );
     flicken_templates.putAssumeCapacity("nop", .{ .name = "nop", .bytes = &.{} });
-    mem.writeInt(u64, syscall_flicken_bytes[2..][0..8], @intFromPtr(&syscalls.syscall_entry), .little);
+    mem.writeInt(u64, syscall_flicken_bytes[4..][0..8], @intFromPtr(&syscalls.syscall_entry), .little);
     flicken_templates.putAssumeCapacity("syscall", .{ .name = "syscall", .bytes = &syscall_flicken_bytes });
 
     {
