@@ -376,6 +376,19 @@ test "nolibc_pie_fork" {
 //     );
 // }
 
+test "nolibc_nopie_signal_handler" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_nopie_signal_handler") },
+        "In signal handler\nSignal handled successfully\n",
+    );
+}
+test "nolibc_pie_signal_handler" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_pie_signal_handler") },
+        "In signal handler\nSignal handled successfully\n",
+    );
+}
+
 fn testPrintArgs(comptime name: []const u8) !void {
     const exe_path = getTestExePath(name);
     const loader_argv: []const []const u8 = &.{ flicker_path, exe_path, "foo", "bar", "baz hi" };

@@ -64,7 +64,23 @@ export fn syscall_handler(ctx: *SavedContext) callconv(.c) void {
             return;
         },
         .rt_sigreturn => {
-            @panic("sigreturn is not supported yet");
+            // The kernel expects the stack pointer to point to the `ucontext` structure. But in our
+            // case `syscallEntry` pushed the `SavedContext` onto the stack.
+            // So we just need to reset the stack pointer to what it was before `syscallEntry` was
+            // called. The `SavedContext` includes the return address pushed by the trampoline, so
+            // the original stack pointer is exactly at the end of `SavedContext`.
+            const rsp_orig = @intFromPtr(ctx) + @sizeOf(SavedContext);
+
+            asm volatile (
+                \\ mov %[rsp], %%rsp
+                \\ syscall
+                \\ ud2
+                :
+                : [rsp] "r" (rsp_orig),
+                  [number] "{rax}" (ctx.rax),
+                : .{ .memory = true }
+            );
+            unreachable;
         },
         .execve, .execveat => |s| {
             // TODO: option to persist across new processes
