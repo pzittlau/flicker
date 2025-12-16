@@ -110,7 +110,6 @@ pub fn main() !void {
     var i: usize = 0;
     const auxv = std.os.linux.elf_aux_maybe.?;
     while (auxv[i].a_type != elf.AT_NULL) : (i += 1) {
-        // TODO: look at other auxv types and check if we need to change them.
         auxv[i].a_un.a_val = switch (auxv[i].a_type) {
             elf.AT_PHDR => base + ehdr.phoff,
             elf.AT_PHENT => ehdr.phentsize,
@@ -122,6 +121,16 @@ pub fn main() !void {
                 log.info("Found vDSO at 0x{x}", .{auxv[i].a_un.a_val});
                 try patchLoadedElf(auxv[i].a_un.a_val);
                 break :blk auxv[i].a_un.a_val;
+            },
+            elf.AT_EXECFD => {
+                @panic("Got AT_EXECFD auxv value");
+                // TODO: handle AT_EXECFD, when needed
+                // The SysV ABI Specification says:
+                // > At process creation the system may pass control to an interpreter program. When
+                // > this happens, the system places either an entry of type AT_EXECFD or one of
+                // > type AT_PHDR in the auxiliary vector. The entry for type AT_EXECFD uses the
+                // > a_val member to contain a file descriptor open to read the application
+                // > program’s object file.
             },
             else => auxv[i].a_un.a_val,
         };

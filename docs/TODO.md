@@ -18,7 +18,7 @@ IvyBridge(2012) and AMD Zen 2 Family 17H(2019) and Linux 5.9(2020).
 - [x] `rt_sigreturn`: we can't use the normal `syscall` interception because we push something onto
       the stack, so `ucontext` isn't on top anymore.
 - [x] `/proc/self/exe`: intercept calls to `readlink`/`readlinkat` with that as argument
-- [ ] `auxv`: check if that is setup correctly and completely
+- [x] `auxv`: check if that is setup correctly and completely
 - [ ] JIT support: intercept `mmap`, `mprotect` and `mremap` that change pages to be executable
 - [ ] `SIGILL` patching fallback
 - [x] `vdso` handling
