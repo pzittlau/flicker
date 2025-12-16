@@ -48,6 +48,8 @@ pub const InstructionIterator = struct {
                     "Byte stepping, to find next valid instruction begin", .{}),
                 zydis.ZYDIS_STATUS_DECODING_ERROR => log.warn("next: Got status: DECODING_ERROR. " ++
                     "Byte stepping, to find next valid instruction begin", .{}),
+                zydis.ZYDIS_STATUS_INVALID_MAP => log.warn("next: Got status: INVALID_MAP. " ++
+                    "Byte stepping, to find next valid instruction begin", .{}),
                 else => log.warn("next: Got unknown status: 0x{x}. Byte stepping, to find next " ++
                     "valid instruction begin", .{status}),
             }

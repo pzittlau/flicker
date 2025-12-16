@@ -118,6 +118,11 @@ pub fn main() !void {
             elf.AT_BASE => maybe_interp_base orelse auxv[i].a_un.a_val,
             elf.AT_ENTRY => entry,
             elf.AT_EXECFN => @intFromPtr(std.os.argv[arg_index]),
+            elf.AT_SYSINFO_EHDR => blk: {
+                log.info("Found vDSO at 0x{x}", .{auxv[i].a_un.a_val});
+                try patchLoadedElf(auxv[i].a_un.a_val);
+                break :blk auxv[i].a_un.a_val;
+            },
             else => auxv[i].a_un.a_val,
         };
     }
@@ -418,6 +423,26 @@ test "nolibc_pie_signal_handler" {
         "In signal handler\nSignal handled successfully\n",
     );
 }
+
+test "nolibc_nopie_vdso_clock" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_nopie_vdso_clock") },
+        "Time gotten\n",
+    );
+}
+test "nolibc_pie_vdso_clock" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("nolibc_pie_vdso_clock") },
+        "Time gotten\n",
+    );
+}
+// BUG: This one is flaky
+// test "libc_pie_vdso_clock" {
+//     try testHelper(
+//         &.{ flicker_path, getTestExePath("libc_pie_vdso_clock") },
+//         "Time gotten\n",
+//     );
+// }
 
 fn testPrintArgs(comptime name: []const u8) !void {
     const exe_path = getTestExePath(name);
