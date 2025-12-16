@@ -71,6 +71,7 @@ pub fn main() !void {
     const base = try loadStaticElf(ehdr, &file_reader);
     const entry = ehdr.entry + if (ehdr.type == .DYN) base else 0;
     log.info("Executable loaded: base=0x{x}, entry=0x{x}", .{ base, entry });
+    try patchLoadedElf(base);
 
     // Check for dynamic linker
     var maybe_interp_base: ?usize = null;
@@ -102,6 +103,7 @@ pub fn main() !void {
             "Interpreter loaded: base=0x{x}, entry=0x{x}",
             .{ interp_base, maybe_interp_entry.? },
         );
+        try patchLoadedElf(interp_base);
         interp.close();
     }
 
@@ -210,14 +212,42 @@ fn loadStaticElf(ehdr: elf.Header, file_reader: *std.fs.File.Reader) !usize {
             return UnfinishedReadError.UnfinishedRead;
 
         const protections = elfToMmapProt(phdr.p_flags);
-        if (protections & posix.PROT.EXEC > 0) {
-            log.info("Patching executable segment", .{});
-            try Patcher.patchRegion(ptr);
-        }
         try posix.mprotect(ptr, protections);
     }
     log.debug("loadElf returning base: 0x{x}", .{@intFromPtr(base.ptr)});
     return @intFromPtr(base.ptr);
+}
+
+fn patchLoadedElf(base: usize) !void {
+    const ehdr = @as(*const elf.Ehdr, @ptrFromInt(base));
+    if (!mem.eql(u8, ehdr.e_ident[0..4], elf.MAGIC)) return error.InvalidElfMagic;
+
+    const phoff = ehdr.e_phoff;
+    const phnum = ehdr.e_phnum;
+    const phentsize = ehdr.e_phentsize;
+
+    var i: usize = 0;
+    while (i < phnum) : (i += 1) {
+        const phdr_ptr = base + phoff + (i * phentsize);
+        const phdr = @as(*const elf.Phdr, @ptrFromInt(phdr_ptr));
+
+        if (phdr.p_type != elf.PT_LOAD) continue;
+        if ((phdr.p_flags & elf.PF_X) == 0) continue;
+
+        // Determine VMA
+        // For ET_EXEC, p_vaddr is absolute.
+        // For ET_DYN, p_vaddr is offset from base.
+        const vaddr = if (ehdr.e_type == elf.ET.DYN) base + phdr.p_vaddr else phdr.p_vaddr;
+        const memsz = phdr.p_memsz;
+
+        const page_start = mem.alignBackward(usize, vaddr, page_size);
+        const page_end = mem.alignForward(usize, vaddr + memsz, page_size);
+
+        const region = @as([*]align(page_size) u8, @ptrFromInt(page_start))[0 .. page_end - page_start];
+
+        log.info("Patching segment: 0x{x} - 0x{x}", .{ page_start, page_end });
+        try Patcher.patchRegion(region);
+    }
 }
 
 /// Converts ELF program header protection flags to mmap protection flags.
