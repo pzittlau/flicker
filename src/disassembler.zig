@@ -6,10 +6,14 @@ const log = std.log.scoped(.disassembler);
 const assert = std.debug.assert;
 
 pub const InstructionIterator = struct {
+    /// Maximum number of warnings to print per iterator before suppressing.
+    pub var max_warnings: u64 = 3;
+
     decoder: zydis.ZydisDecoder,
     bytes: []const u8,
     instruction: zydis.ZydisDecodedInstruction,
     operands: [zydis.ZYDIS_MAX_OPERAND_COUNT]zydis.ZydisDecodedOperand,
+    warnings: usize = 0,
 
     pub fn init(bytes: []const u8) InstructionIterator {
         var decoder: zydis.ZydisDecoder = undefined;
@@ -38,29 +42,33 @@ pub const InstructionIterator = struct {
         var address: u64 = @intFromPtr(iterator.bytes.ptr);
 
         while (!zydis.ZYAN_SUCCESS(status)) {
-            // TODO: handle common padding bytes
-            switch (status) {
-                zydis.ZYDIS_STATUS_NO_MORE_DATA => {
-                    log.info("next: Got status: NO_MORE_DATA. Iterator completed.", .{});
-                    return null;
-                },
-                zydis.ZYDIS_STATUS_ILLEGAL_LOCK => log.warn("next: Got status: ILLEGAL_LOCK. " ++
-                    "Byte stepping, to find next valid instruction begin", .{}),
-                zydis.ZYDIS_STATUS_DECODING_ERROR => log.warn("next: Got status: DECODING_ERROR. " ++
-                    "Byte stepping, to find next valid instruction begin", .{}),
-                zydis.ZYDIS_STATUS_INVALID_MAP => log.warn("next: Got status: INVALID_MAP. " ++
-                    "Byte stepping, to find next valid instruction begin", .{}),
-                else => log.warn("next: Got unknown status: 0x{x}. Byte stepping, to find next " ++
-                    "valid instruction begin", .{status}),
+            if (status == zydis.ZYDIS_STATUS_NO_MORE_DATA) {
+                log.debug("next: Got status: NO_MORE_DATA. Iterator completed.", .{});
+                return null;
             }
+
+            // TODO: handle common padding bytes
             // TODO: add a flag to instead return an error
+            iterator.warnings += 1;
+            if (iterator.warnings <= max_warnings) {
+                const err_desc = switch (status) {
+                    zydis.ZYDIS_STATUS_ILLEGAL_LOCK => "ILLEGAL_LOCK",
+                    zydis.ZYDIS_STATUS_DECODING_ERROR => "DECODING_ERROR",
+                    zydis.ZYDIS_STATUS_INVALID_MAP => "INVALID_MAP",
+                    else => "UNKNOWN",
+                };
+                log.warn(
+                    "next: Got status: {s} (0x{x}). Byte stepping, for next instruction begin",
+                    .{ err_desc, status },
+                );
+                if (iterator.warnings == max_warnings) {
+                    log.warn("next: Suppressing further warnings for this disassembly.", .{});
+                }
+            }
+
             log.debug(
-                "next: instruction length: {}, address: 0x{x}, bytes: 0x{x}",
-                .{
-                    iterator.instruction.length,
-                    address,
-                    iterator.bytes[0..iterator.instruction.length],
-                },
+                "next: skipping byte at address: 0x{x}, byte: 0x{x}",
+                .{ address, iterator.bytes[0] },
             );
 
             iterator.bytes = iterator.bytes[1..];
