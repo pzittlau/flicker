@@ -16,7 +16,7 @@ dynamic instrumentation.
 This project is currently in active development.
 
 Already supported are Statically linked executables, basic dynamically linked executables (via
-`PT_INTERP` loading), and basic syscall interception
+`PT_INTERP` loading), and basic syscall interception.
 
 Full `dlopen` support, JIT handling, signal handling, and a plugin system are pending.
 
@@ -47,6 +47,9 @@ Flicker acts as a loader wrapper. Pass the target executable and its arguments d
 ```
 
 ## How it Works
+
+For more information see the [Project Overview](docs/project_overview.md) and the [Use
+Cases](docs/use_cases.md).
 
 ### The Loader
 
