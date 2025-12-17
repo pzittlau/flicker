@@ -209,8 +209,8 @@ pub const Statistics = struct {
 /// Scans a memory region for instructions that require patching and applies the patches
 /// using a hierarchy of tactics (Direct/Punning -> Successor Eviction -> Neighbor Eviction).
 ///
-/// The region is processed Back-to-Front to ensure that modifications (punning) only
-/// constrain instructions that have already been processed or are locked.
+/// NOTE: This function leaves the region as R|W and the caller is responsible for changing it to
+/// the desired protection
 pub fn patchRegion(region: []align(page_size) u8) !void {
     // For now just do a coarse lock.
     // TODO: should we make this more fine grained?
@@ -296,8 +296,6 @@ pub fn patchRegion(region: []align(page_size) u8) !void {
     {
         // Apply patches.
         try posix.mprotect(region, posix.PROT.READ | posix.PROT.WRITE);
-        defer posix.mprotect(region, posix.PROT.READ | posix.PROT.EXEC) catch
-            @panic("patchRegion: mprotect back to R|X failed. Can't continue");
 
         var stats = Statistics.empty;
         // Used to track which bytes have been modified or used for constraints (punning),

@@ -261,6 +261,7 @@ fn patchLoadedElf(base: usize) !void {
 
         log.info("Patching segment: 0x{x} - 0x{x}", .{ page_start, page_end });
         try Patcher.patchRegion(region);
+        try posix.mprotect(region, elfToMmapProt(phdr.p_flags));
     }
 }
 
