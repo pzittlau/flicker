@@ -854,7 +854,7 @@ fn ensureRangeWritable(
         const gop = try allocated_pages.getOrPut(gpa, page_addr);
         if (gop.found_existing) {
             const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr);
-            try posix.mprotect(ptr[0..page_addr], protection);
+            try posix.mprotect(ptr[0..page_size], protection);
         } else {
             const addr = posix.mmap(
                 @ptrFromInt(page_addr),

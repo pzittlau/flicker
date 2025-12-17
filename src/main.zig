@@ -332,10 +332,9 @@ test "nolibc_nopie_exit" {
 test "nolibc_pie_exit" {
     try testHelper(&.{ flicker_path, getTestExePath("nolibc_pie_exit") }, "");
 }
-// BUG: This one is flaky
-// test "libc_pie_exit" {
-//     try testHelper(&.{ flicker_path, getTestExePath("libc_pie_exit") }, "");
-// }
+test "libc_pie_exit" {
+    try testHelper(&.{ flicker_path, getTestExePath("libc_pie_exit") }, "");
+}
 
 test "nolibc_nopie_helloWorld" {
     try testHelper(&.{ flicker_path, getTestExePath("nolibc_nopie_helloWorld") }, "Hello World!\n");
@@ -343,10 +342,9 @@ test "nolibc_nopie_helloWorld" {
 test "nolibc_pie_helloWorld" {
     try testHelper(&.{ flicker_path, getTestExePath("nolibc_pie_helloWorld") }, "Hello World!\n");
 }
-// BUG: This one is flaky
-// test "libc_pie_helloWorld" {
-//     try testHelper(&.{ flicker_path, getTestExePath("libc_pie_helloWorld") }, "Hello World!\n");
-// }
+test "libc_pie_helloWorld" {
+    try testHelper(&.{ flicker_path, getTestExePath("libc_pie_helloWorld") }, "Hello World!\n");
+}
 
 test "nolibc_nopie_printArgs" {
     try testPrintArgs("nolibc_nopie_printArgs");
@@ -354,10 +352,9 @@ test "nolibc_nopie_printArgs" {
 test "nolibc_pie_printArgs" {
     try testPrintArgs("nolibc_pie_printArgs");
 }
-// BUG: This one is flaky
-// test "libc_pie_printArgs" {
-//     try testPrintArgs("libc_pie_printArgs");
-// }
+test "libc_pie_printArgs" {
+    try testPrintArgs("libc_pie_printArgs");
+}
 
 test "nolibc_nopie_readlink" {
     try testReadlink("nolibc_nopie_readlink");
@@ -365,7 +362,7 @@ test "nolibc_nopie_readlink" {
 test "nolibc_pie_readlink" {
     try testReadlink("nolibc_pie_readlink");
 }
-// BUG: This one just outputs the path to the flicker executable and is likely also flaky
+// BUG: This one just outputs the path to the flicker executable
 // test "libc_pie_readlink" {
 //     try testReadlink("libc_pie_readlink");
 // }
@@ -396,10 +393,6 @@ test "nolibc_pie_clone_no_new_stack" {
     );
 }
 
-test "echo" {
-    try testHelper(&.{ "echo", "Hello", "There" }, "Hello There\n");
-}
-
 test "nolibc_nopie_fork" {
     try testHelper(
         &.{ flicker_path, getTestExePath("nolibc_nopie_fork") },
@@ -412,13 +405,12 @@ test "nolibc_pie_fork" {
         "Child: I'm alive!\nParent: Child died.\n",
     );
 }
-// BUG: This one is flaky
-// test "libc_pie_fork" {
-//     try testHelper(
-//         &.{ flicker_path, getTestExePath("libc_pie_fork") },
-//         "Child: I'm alive!\nParent: Child died.\n",
-//     );
-// }
+test "libc_pie_fork" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("libc_pie_fork") },
+        "Child: I'm alive!\nParent: Child died.\n",
+    );
+}
 
 test "nolibc_nopie_signal_handler" {
     try testHelper(
@@ -445,13 +437,16 @@ test "nolibc_pie_vdso_clock" {
         "Time gotten\n",
     );
 }
-// BUG: This one is flaky
-// test "libc_pie_vdso_clock" {
-//     try testHelper(
-//         &.{ flicker_path, getTestExePath("libc_pie_vdso_clock") },
-//         "Time gotten\n",
-//     );
-// }
+test "libc_pie_vdso_clock" {
+    try testHelper(
+        &.{ flicker_path, getTestExePath("libc_pie_vdso_clock") },
+        "Time gotten\n",
+    );
+}
+
+test "echo" {
+    try testHelper(&.{ "echo", "Hello", "There" }, "Hello There\n");
+}
 
 fn testPrintArgs(comptime name: []const u8) !void {
     const exe_path = getTestExePath(name);

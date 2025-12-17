@@ -22,7 +22,7 @@ IvyBridge(2012) and AMD Zen 2 Family 17H(2019) and Linux 5.9(2020).
 - [ ] JIT support: intercept `mmap`, `mprotect` and `mremap` that change pages to be executable
 - [ ] `SIGILL` patching fallback
 - [x] `vdso` handling
-- [ ] check why the libc tests are flaky
+- [x] check why the libc tests are flaky
 
 ## Minor things
 
