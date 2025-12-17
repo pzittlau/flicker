@@ -1,7 +1,10 @@
 const std = @import("std");
 const linux = std.os.linux;
+const posix = std.posix;
 const Patcher = @import("Patcher.zig");
 const assert = std.debug.assert;
+
+const page_size = std.heap.pageSize();
 
 /// Represents the stack layout pushed by `syscallEntry` before calling the handler.
 pub const SavedContext = extern struct {
@@ -80,30 +83,75 @@ export fn syscall_handler(ctx: *SavedContext) callconv(.c) void {
                 : .{ .memory = true });
             unreachable;
         },
-        .execve, .execveat => |s| {
-            // TODO: option to persist across new processes
-            std.debug.print("syscall {} called\n", .{s});
+        .mmap => {
+            // mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+
+            const prot: u32 = @intCast(ctx.rdx);
+            // Execute the syscall first to get the address (rax)
+            ctx.rax = executeSyscall(ctx);
+            const addr = ctx.rax;
+            const len = ctx.rsi;
+
+            const is_error = @as(i64, @bitCast(ctx.rax)) < 0;
+            if (is_error) return;
+            if ((prot & posix.PROT.EXEC) == 0) return;
+            if (len <= 0) return;
+
+            // mmap addresses are always page aligned
+            const ptr = @as([*]align(page_size) u8, @ptrFromInt(addr));
+            // Check if we can patch it
+            Patcher.patchRegion(ptr[0..len]) catch |err| {
+                std.log.warn("JIT Patching failed: {}", .{err});
+            };
+
+            // patchRegion leaves it as RW. We need to restore to requested prot.
+            _ = linux.syscall3(.mprotect, addr, len, prot);
+            return;
         },
-        .prctl, .arch_prctl, .set_tid_address => |s| {
+        .mprotect => {
+            // mprotect(void *addr, size_t len, int prot)
+            // TODO: cleanup trampolines, when removing X
+            const prot: u32 = @intCast(ctx.rdx);
+            if ((prot & posix.PROT.EXEC) != 0) {
+                const addr = ctx.rdi;
+                const len = ctx.rsi;
+                // mprotect requires addr to be page aligned.
+                if (len > 0 and std.mem.isAligned(addr, page_size)) {
+                    const ptr = @as([*]align(page_size) u8, @ptrFromInt(addr));
+                    Patcher.patchRegion(ptr[0..len]) catch |err| {
+                        std.log.warn("mprotect Patching failed: {}", .{err});
+                    };
+                    // patchRegion leaves it R|W.
+                }
+            }
+            ctx.rax = executeSyscall(ctx);
+            return;
+        },
+        .execve, .execveat => {
+            // TODO: option to persist across new processes
+            ctx.rax = executeSyscall(ctx);
+            return;
+        },
+        .prctl, .arch_prctl, .set_tid_address => {
             // TODO: what do we need to handle from these?
             // process name
             // fs base(gs?)
             // thread id pointers
-            std.debug.print("syscall {} called\n", .{s});
-        },
-        .mmap, .mprotect => {
-            // TODO: JIT support
-            // TODO: cleanup
+            ctx.rax = executeSyscall(ctx);
+            return;
         },
         .munmap, .mremap => {
             // TODO: cleanup
+            ctx.rax = executeSyscall(ctx);
+            return;
         },
-
-        else => {},
+        else => {
+            // Write result back to the saved RAX so it is restored to the application.
+            ctx.rax = executeSyscall(ctx);
+            return;
+        },
     }
-
-    // Write result back to the saved RAX so it is restored to the application.
-    ctx.rax = executeSyscall(ctx);
+    unreachable;
 }
 
 inline fn executeSyscall(ctx: *SavedContext) u64 {

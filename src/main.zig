@@ -363,10 +363,9 @@ test "nolibc_nopie_readlink" {
 test "nolibc_pie_readlink" {
     try testReadlink("nolibc_pie_readlink");
 }
-// BUG: This one just outputs the path to the flicker executable
-// test "libc_pie_readlink" {
-//     try testReadlink("libc_pie_readlink");
-// }
+test "libc_pie_readlink" {
+    try testReadlink("libc_pie_readlink");
+}
 
 test "nolibc_nopie_clone_raw" {
     try testHelper(
