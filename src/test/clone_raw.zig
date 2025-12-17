@@ -34,9 +34,6 @@ pub fn main() !void {
         \\ mov $60, %%rax       # SYS_exit
         \\ syscall
         \\
-        \\ # Should not be reached
-        \\ ud2
-        \\
         \\ 1:
         \\ # Parent Path continues
         : [ret] "={rax}" (-> usize),

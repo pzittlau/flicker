@@ -74,12 +74,10 @@ export fn syscall_handler(ctx: *SavedContext) callconv(.c) void {
             asm volatile (
                 \\ mov %[rsp], %%rsp
                 \\ syscall
-                \\ ud2
                 :
                 : [rsp] "r" (rsp_orig),
                   [number] "{rax}" (ctx.rax),
-                : .{ .memory = true }
-            );
+                : .{ .memory = true });
             unreachable;
         },
         .execve, .execveat => |s| {
