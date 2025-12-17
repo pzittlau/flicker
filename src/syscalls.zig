@@ -6,6 +6,8 @@ const assert = std.debug.assert;
 
 const page_size = std.heap.pageSize();
 
+const log = std.log.scoped(.syscalls);
+
 /// Represents the stack layout pushed by `syscallEntry` before calling the handler.
 pub const SavedContext = extern struct {
     padding: u64, // Result of `sub $8, %rsp` for alignment
@@ -90,13 +92,25 @@ export fn syscall_handler(ctx: *SavedContext) callconv(.c) void {
             // Execute the syscall first to get the address (rax)
             ctx.rax = executeSyscall(ctx);
             const addr = ctx.rax;
-            const len = ctx.rsi;
+            var len = ctx.rsi;
+            const flags: linux.MAP = @bitCast(@as(u32, @intCast(ctx.r10)));
+            const fd: linux.fd_t = @bitCast(@as(u32, @truncate(ctx.r8)));
+            const offset = ctx.r9;
 
             const is_error = @as(i64, @bitCast(ctx.rax)) < 0;
             if (is_error) return;
             if ((prot & posix.PROT.EXEC) == 0) return;
-            if (len <= 0) return;
 
+            // If file-backed (not anonymous), clamp len to file size to avoid SIGBUS
+            if (!flags.ANONYMOUS) {
+                var stat: linux.Stat = undefined;
+                if (0 == linux.fstat(fd, &stat) and linux.S.ISREG(stat.mode)) {
+                    const file_size: u64 = @intCast(stat.size);
+                    len = if (offset >= file_size) 0 else @min(len, file_size - offset);
+                }
+            }
+
+            if (len <= 0) return;
             // mmap addresses are always page aligned
             const ptr = @as([*]align(page_size) u8, @ptrFromInt(addr));
             // Check if we can patch it

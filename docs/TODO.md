@@ -19,7 +19,7 @@ IvyBridge(2012) and AMD Zen 2 Family 17H(2019) and Linux 5.9(2020).
       the stack, so `ucontext` isn't on top anymore.
 - [x] `/proc/self/exe`: intercept calls to `readlink`/`readlinkat` with that as argument
 - [x] `auxv`: check if that is setup correctly and completely
-- [ ] JIT support: intercept `mmap`, `mprotect` and `mremap` that change pages to be executable
+- [x] JIT support: intercept `mmap`, `mprotect` and `mremap` that change pages to be executable
 - [ ] `SIGILL` patching fallback
 - [x] `vdso` handling
 - [x] check why the libc tests are flaky
@@ -31,6 +31,8 @@ IvyBridge(2012) and AMD Zen 2 Family 17H(2019) and Linux 5.9(2020).
 - [ ] Ghost page edge case: In all patch strategies, if a range spans multiple pages and we `mmap`
     the first one but can't `mmap` the second one we just let the first one mapped. It would be better
     to unmap them
+- [ ] Right now when patching we mmap a page and may not use it, but we still leave it mapped. This
+      leaks memory. If we fix this correctly the Ghost page issue is also fixed
 - [ ] Re-entrancy for `patchRegion`
     - when a signal comes, while we are in that function, and we need to patch something due to the
       signal we will deadlock
@@ -46,3 +48,5 @@ IvyBridge(2012) and AMD Zen 2 Family 17H(2019) and Linux 5.9(2020).
 - [ ] `modify_ldt`: check what we need to intercept and change
 - [ ] `set_tid_address`: check what we need to intercept and change
 - [ ] performance optimizations for patched code? Peephole might be possible
+- [ ] maybe add a way to run something after the client is finished
+    - could be useful for statistics, cleanup(if necessary), or notifying of suppressed warnings

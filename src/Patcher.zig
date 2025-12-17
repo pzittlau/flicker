@@ -212,6 +212,10 @@ pub const Statistics = struct {
 /// NOTE: This function leaves the region as R|W and the caller is responsible for changing it to
 /// the desired protection
 pub fn patchRegion(region: []align(page_size) u8) !void {
+    log.info(
+        "Patching region: 0x{x} - 0x{x}",
+        .{ @intFromPtr(region.ptr), @intFromPtr(&region[region.len - 1]) },
+    );
     // For now just do a coarse lock.
     // TODO: should we make this more fine grained?
     mutex.lock();

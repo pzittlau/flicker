@@ -256,10 +256,10 @@ fn patchLoadedElf(base: usize) !void {
 
         const page_start = mem.alignBackward(usize, vaddr, page_size);
         const page_end = mem.alignForward(usize, vaddr + memsz, page_size);
+        const size = page_end - page_start;
 
-        const region = @as([*]align(page_size) u8, @ptrFromInt(page_start))[0 .. page_end - page_start];
+        const region = @as([*]align(page_size) u8, @ptrFromInt(page_start))[0..size];
 
-        log.info("Patching segment: 0x{x} - 0x{x}", .{ page_start, page_end });
         try Patcher.patchRegion(region);
         try posix.mprotect(region, elfToMmapProt(phdr.p_flags));
     }
