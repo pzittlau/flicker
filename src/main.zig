@@ -221,6 +221,8 @@ fn loadStaticElf(ehdr: elf.Header, file_reader: *std.fs.File.Reader) !usize {
             .{ phdr_idx, start, start + size, phdr.p_vaddr, base_for_dyn },
         );
         const ptr: []align(page_size) u8 = @as([*]align(page_size) u8, @ptrFromInt(start))[0..size];
+        // TODO: we should likely just use mmap instead because then not touched memory isn't loaded
+        // unnecessarily
         try file_reader.seekTo(phdr.p_offset);
         if (try file_reader.read(ptr[offset..][0..phdr.p_filesz]) != phdr.p_filesz)
             return UnfinishedReadError.UnfinishedRead;
@@ -254,6 +256,7 @@ fn patchLoadedElf(base: usize) !void {
         const vaddr = if (ehdr.e_type == elf.ET.DYN) base + phdr.p_vaddr else phdr.p_vaddr;
         const memsz = phdr.p_memsz;
 
+        // TODO: does this really need to be aligned
         const page_start = mem.alignBackward(usize, vaddr, page_size);
         const page_end = mem.alignForward(usize, vaddr + memsz, page_size);
         const size = page_end - page_start;

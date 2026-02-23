@@ -40,7 +40,7 @@ pub const SavedContext = extern struct {
 export fn syscall_handler(ctx: *SavedContext) callconv(.c) void {
     // TODO: Handle signals (masking) to prevent re-entrancy issues if we touch global state.
 
-    const sys: linux.SYS = @enumFromInt(ctx.rax);
+    const sys: linux.syscalls.X64 = @enumFromInt(ctx.rax);
 
     switch (sys) {
         .readlink => {
