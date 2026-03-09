@@ -1,28 +1,27 @@
 const std = @import("std");
-const builtin = @import("builtin");
-const testing = std.testing;
 const math = std.math;
 const mem = std.mem;
 const posix = std.posix;
-const zydis = @import("zydis").zydis;
-const dis = @import("disassembler.zig");
-const syscalls = @import("syscalls.zig");
+const testing = std.testing;
 
-const log = std.log.scoped(.patcher);
+const dis = @import("disassembler.zig");
+const reloc = @import("relocation.zig");
+const syscalls = @import("syscalls.zig");
+const zydis = @import("zydis").zydis;
+
 const AddressAllocator = @import("AddressAllocator.zig");
-const InstructionFormatter = dis.InstructionFormatter;
-const InstructionIterator = dis.InstructionIterator;
-const PatchLocationIterator = @import("PatchLocationIterator.zig");
-const PatchByte = PatchLocationIterator.PatchByte;
+const backend = @import("backend.zig").backend;
 const Range = @import("Range.zig");
+const Statistics = @import("Statistics.zig");
 
 const assert = std.debug.assert;
-
 const page_size = std.heap.pageSize();
-const jump_rel32: u8 = 0xe9;
-const jump_rel32_size = 5;
-const jump_rel8: u8 = 0xeb;
-const jump_rel8_size = 2;
+const log = std.log.scoped(.patcher);
+
+const j_rel32: u8 = 0xe9;
+const j_rel32_size = 5;
+const j_rel8: u8 = 0xeb;
+const j_rel8_size = 2;
 
 // TODO: Find an invalid instruction to use.
 // const invalid: u8 = 0xaa;
@@ -48,68 +47,40 @@ var syscall_flicken_bytes = [_]u8{
     0x41, 0xff, 0xd3, // call r11
 };
 
-pub var gpa: mem.Allocator = undefined;
-pub var flicken_templates: std.StringArrayHashMapUnmanaged(Flicken) = .empty;
-pub var address_allocator: AddressAllocator = .empty;
-/// Tracks the base addresses of pages we have mmap'd for Flicken.
-pub var allocated_pages: std.AutoHashMapUnmanaged(u64, void) = .empty;
-pub var mutex: std.Thread.Mutex = .{};
+const Patcher = @This();
 
-pub var target_exec_path_buf: [std.fs.max_path_bytes]u8 = @splat(0);
-pub var target_exec_path: []const u8 = undefined;
+mutex: std.Thread.Mutex = .{},
+address_allocator: AddressAllocator,
+flicken_templates: std.StringArrayHashMapUnmanaged(Flicken) = .empty,
 
-/// Initialize the patcher.
-/// NOTE: This should only be called **once**.
-pub fn init() !void {
-    gpa = std.heap.page_allocator;
+pub fn init(allocator: mem.Allocator) !Patcher {
+    var patcher: Patcher = .{
+        .address_allocator = .{ .child_allocator = allocator },
+    };
 
-    try flicken_templates.ensureTotalCapacity(
-        std.heap.page_allocator,
+    try patcher.flicken_templates.ensureTotalCapacity(
+        patcher.address_allocator.allocator(),
         page_size / @sizeOf(Flicken),
     );
-    flicken_templates.putAssumeCapacity("nop", .{ .name = "nop", .bytes = &.{} });
+    patcher.flicken_templates.putAssumeCapacity("nop", .{ .name = "nop", .bytes = &.{} });
     mem.writeInt(
         u64,
         syscall_flicken_bytes[2..][0..8],
         @intFromPtr(&syscalls.syscallEntry),
         .little,
     );
-    flicken_templates.putAssumeCapacity("syscall", .{ .name = "syscall", .bytes = &syscall_flicken_bytes });
+    patcher.flicken_templates.putAssumeCapacity(
+        "syscall",
+        .{ .name = "syscall", .bytes = &syscall_flicken_bytes },
+    );
 
-    {
-        // Read mmap_min_addr to block the low memory range. This prevents us from allocating
-        // trampolines in the forbidden low address range.
-        var min_addr: u64 = 0x10000; // Default safe fallback (64KB)
-        if (std.fs.openFileAbsolute("/proc/sys/vm/mmap_min_addr", .{})) |file| {
-            defer file.close();
-            var buf: [32]u8 = undefined;
-            if (file.readAll(&buf)) |len| {
-                const trimmed = std.mem.trim(u8, buf[0..len], " \n\r\t");
-                if (std.fmt.parseInt(u64, trimmed, 10)) |val| {
-                    min_addr = val;
-                } else |_| {}
-            } else |_| {}
-        } else |_| {}
-        try address_allocator.block(gpa, .{ .start = 0, .end = @intCast(min_addr) }, 0);
-    }
+    return patcher;
 }
 
-/// Flicken name and bytes have to be valid for the lifetime it's used. If a trampoline with the
-/// name is already registered it gets overwritten.
-/// NOTE: The name "nop" is reserved and always has the ID 0.
-pub fn addFlicken(trampoline: Flicken) !FlickenId {
-    assert(!mem.eql(u8, "nop", trampoline.name));
-    assert(!mem.eql(u8, "syscall", trampoline.name));
-    try flicken_templates.ensureUnusedCapacity(gpa, 1);
-    errdefer comptime unreachable;
-
-    const gop = flicken_templates.getOrPutAssumeCapacity(trampoline.name);
-    if (gop.found_existing) {
-        log.warn("addTrampoline: Overwriting existing trampoline: {s}", .{trampoline.name});
-    }
-    gop.key_ptr.* = trampoline.name;
-    gop.value_ptr.* = trampoline;
-    return @enumFromInt(gop.index);
+pub fn deinit(patcher: *Patcher) void {
+    const allocator = patcher.address_allocator.allocator();
+    patcher.flicken_templates.deinit(allocator);
+    patcher.address_allocator.deinit();
 }
 
 pub const Flicken = struct {
@@ -117,11 +88,11 @@ pub const Flicken = struct {
     bytes: []const u8,
 
     pub fn size(flicken: *const Flicken) u64 {
-        return flicken.bytes.len + jump_rel32_size;
+        return flicken.bytes.len + j_rel32_size;
     }
 };
 
-pub const FlickenId = enum(u64) {
+pub const FlickenId = enum(u32) {
     /// The nop flicken is special. It just does the patched instruction and immediately jumps back
     /// to the normal instruction stream. It **cannot** be changed.
     /// The bytes are always empty, meaning that `bytes.len == 0`.
@@ -141,8 +112,7 @@ pub const PatchRequest = struct {
     offset: u64,
     /// Number of bytes of instruction.
     size: u8,
-    /// A byte slice from the start of the offset to the end of the region. This isn't necessary to
-    /// have but makes things more accessible.
+    /// The bytes of the original code, starting at this instruction.
     bytes: []u8,
 
     pub fn desc(_: void, lhs: PatchRequest, rhs: PatchRequest) bool {
@@ -160,100 +130,41 @@ pub const PatchRequest = struct {
     }
 };
 
-pub const Statistics = struct {
-    /// Direct jumps
-    jump: u64,
-    /// Punning - index represents number of prefixes used
-    punning: [4]u64,
-    /// Successor Eviction
-    successor_eviction: u64,
-    /// Neighbor Eviction
-    neighbor_eviction: u64,
-    /// Failed to patch
-    failed: u64,
-
-    pub const empty = mem.zeroes(Statistics);
-
-    pub fn punningSum(stats: *const Statistics) u64 {
-        return stats.punning[0] + stats.punning[1] +
-            stats.punning[2] + stats.punning[3];
-    }
-
-    pub fn successful(stats: *const Statistics) u64 {
-        return stats.jump + stats.punningSum() +
-            stats.successor_eviction + stats.neighbor_eviction;
-    }
-
-    pub fn total(stats: *const Statistics) u64 {
-        return stats.successful() + stats.failed;
-    }
-
-    pub fn percentage(stats: *const Statistics) f64 {
-        if (stats.total() == 0) return 1;
-        const s: f64 = @floatFromInt(stats.successful());
-        const t: f64 = @floatFromInt(stats.total());
-        return s / t;
-    }
-
-    pub fn add(self: *Statistics, other: *const Statistics) void {
-        self.jump += other.jump;
-        for (0..self.punning.len) |i| {
-            self.punning[i] += other.punning[i];
-        }
-        self.successor_eviction += other.successor_eviction;
-        self.neighbor_eviction += other.neighbor_eviction;
-        self.failed += other.failed;
-    }
-};
-
-/// Scans a memory region for instructions that require patching and applies the patches
-/// using a hierarchy of tactics (Direct/Punning -> Successor Eviction -> Neighbor Eviction).
+/// Scans a memory region for instructions that require patching and applies the patches using a
+/// hierarchy of tactics (Direct/Punning -> Successor Eviction -> Neighbor Eviction).
 ///
-/// NOTE: This function leaves the region as R|W and the caller is responsible for changing it to
-/// the desired protection
-pub fn patchRegion(region: []align(page_size) u8) !void {
+/// Assert that the region is already mapped as R|W. The caller is responsible for changing it to
+/// the desired protection after patching is done.
+pub fn patchRegion(patcher: *Patcher, region: []align(page_size) u8) !void {
     log.info(
-        "Patching region: 0x{x} - 0x{x}",
+        "patchRegion: 0x{x} - 0x{x}",
         .{ @intFromPtr(region.ptr), @intFromPtr(&region[region.len - 1]) },
     );
-    // For now just do a coarse lock.
-    // TODO: should we make this more fine grained?
-    mutex.lock();
-    defer mutex.unlock();
 
-    {
-        // Block the region, such that we don't try to allocate there anymore.
-        const start: i64 = @intCast(@intFromPtr(region.ptr));
-        try address_allocator.block(
-            gpa,
-            .{ .start = start, .end = start + @as(i64, @intCast(region.len)) },
-            page_size,
-        );
-    }
+    patcher.mutex.lock();
+    defer patcher.mutex.unlock();
 
-    var arena_impl = std.heap.ArenaAllocator.init(gpa);
+    // Make the application code writable so we can inject our jumps.
+    try backend.mprotect(region, posix.PROT.READ | posix.PROT.WRITE);
+
+    try patcher.address_allocator.block(.fromPtr(region.ptr, region.len));
+
+    var arena_impl = std.heap.ArenaAllocator.init(patcher.address_allocator.allocator());
     const arena = arena_impl.allocator();
     defer arena_impl.deinit();
 
     var patch_requests: std.ArrayListUnmanaged(PatchRequest) = .empty;
-    // We save the bytes where instructions start to be able to disassemble them on the fly. This is
-    // necessary for the neighbor eviction, since we can't just iterate forwards from a target
-    // instruction and disassemble happily. This is because some bytes may already be the patched
-    // ones which means that we might disassemble garbage or something different that wasn't there
-    // before. This means that we would need to stop disassembling on the first byte that is locked,
-    // which kind of defeats the purpose of neighbor eviction.
-    var instruction_starts = try std.DynamicBitSetUnmanaged.initEmpty(arena, region.len);
+    var instruction_starts: std.DynamicBitSetUnmanaged = try .initEmpty(arena, region.len);
 
     {
-        // Get where to patch.
-        var instruction_iterator = InstructionIterator.init(region);
-        while (instruction_iterator.next()) |instruction| {
+        log.info("patchRegion: Collecting patch requests", .{});
+        var instruction_iter = dis.InstructionIterator.init(region);
+        while (instruction_iter.next()) |instruction| {
             const offset = instruction.address - @intFromPtr(region.ptr);
             instruction_starts.set(offset);
 
             const is_syscall = instruction.instruction.mnemonic == zydis.ZYDIS_MNEMONIC_SYSCALL;
-            const should_patch = is_syscall or
-                instruction.instruction.attributes & zydis.ZYDIS_ATTRIB_HAS_LOCK > 0;
+            const should_patch = is_syscall;
             if (should_patch) {
                 const request: PatchRequest = .{
                     .flicken = if (is_syscall) .syscall else .nop,
@@ -280,814 +191,842 @@ pub fn patchRegion(region: []align(page_size) u8) !void {
                     "patchRegion: Found duplicate patch requests for instruction: {s}",
                     .{fmt},
                 );
-                log.err("patchRegion: request 1: {f}", .{patch_requests.items[i - 1]});
-                log.err("patchRegion: request 2: {f}", .{patch_requests.items[i]});
+                log.err("  request 1: {f}", .{patch_requests.items[i - 1]});
+                log.err("  request 2: {f}", .{patch_requests.items[i]});
                 return error.DuplicatePatchRequest;
             }
             last_offset = request.offset;
 
-            if (@as(u64, @intFromEnum(request.flicken)) >= flicken_templates.count()) {
+            if (@as(u64, @intFromEnum(request.flicken)) >= patcher.flicken_templates.count()) {
                 const fmt = dis.formatBytes(request.bytes[0..request.size]);
                 log.err(
                     "patchRegion: Usage of undefined flicken in request {f} for instruction: {s}",
                     .{ request, fmt },
                 );
-                return error.undefinedFlicken;
+                return error.UndefinedFlicken;
             }
         }
     }
 
-    {
-        // Apply patches.
-        try posix.mprotect(region, posix.PROT.READ | posix.PROT.WRITE);
-
-        var stats = Statistics.empty;
-        // Used to track which bytes have been modified or used for constraints (punning),
-        // to prevent future patches (from neighbor/successor eviction) from corrupting them.
-        var locked_bytes = try std.DynamicBitSetUnmanaged.initEmpty(arena, region.len);
-        // PERF: A set of the pages for the patches/flicken we made writable. This way we don't
-        // repeatedly change call `mprotect` on the same page to switch it from R|W to R|X and back.
-        // At the end we `mprotect` all pages in this set back to being R|X.
-        var pages_made_writable: std.AutoHashMapUnmanaged(u64, void) = .empty;
-
-        requests: for (patch_requests.items) |request| {
-            for (0..request.size) |i| {
-                if (locked_bytes.isSet(request.offset + i)) {
-                    log.warn("patchRegion: Skipping request at offset 0x{x} because it is locked", .{request.offset});
-                    stats.failed += 1;
-                    continue :requests;
-                }
-            }
-
-            if (try attemptDirectOrPunning(
-                request,
-                arena,
-                &locked_bytes,
-                &pages_made_writable,
-                &stats,
-            )) {
+    // Used to track which bytes have been modified or used for constraints (punning), to
+    // prevent future patches (neighbor/successor eviction) from corrupting them.
+    var locked_bytes = try std.DynamicBitSetUnmanaged.initEmpty(arena, region.len);
+    // A set of the pages for the patches/flicken we made writable. This way we don't repeatedly
+    // change call `mprotect` on the same page to switch it from R|W to R|X and back. At the end
+    // we `mprotect` all pages in this set back to being R|X.
+    var pages_made_writable: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    var stats: Statistics = .empty;
+    requests: for (patch_requests.items) |request| {
+        for (0..request.size) |i| {
+            if (locked_bytes.isSet(request.offset + i)) {
+                log.warn(
+                    "patchRegion: Skipping request at offset 0x{x} because it is locked",
+                    .{request.offset},
+                );
                 continue :requests;
             }
+        }
 
-            if (try attemptSuccessorEviction(
-                request,
-                arena,
-                &locked_bytes,
-                &pages_made_writable,
-                &stats,
-            )) {
-                continue :requests;
-            }
-
-            if (try attemptNeighborEviction(
-                request,
-                arena,
-                &locked_bytes,
-                &pages_made_writable,
-                &instruction_starts,
-                &stats,
-            )) {
-                continue :requests;
-            }
-
+        const result = patcher.patchRequest(request, region, instruction_starts, locked_bytes) catch |err| {
+            log.err("patchRegion: Failed to patch request at offset 0x{x}: {}", .{ request.offset, err });
             stats.failed += 1;
+            continue;
+        };
+
+        switch (result.tactic) {
+            .jump => stats.jump += 1,
+            .punning => |n| stats.punning[n] += 1,
+            .successor_eviction => stats.successor_eviction += 1,
+            .neighbor_eviction => stats.neighbor_eviction += 1,
         }
 
-        // Change pages back to R|X.
-        var iter = pages_made_writable.keyIterator();
-        const protection = posix.PROT.READ | posix.PROT.EXEC;
-        while (iter.next()) |page_addr| {
-            const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr.*);
-            try posix.mprotect(ptr[0..page_size], protection);
-        }
+        // Now nothing should error anymore, so we "commit" the patches
+        for (result.patches) |p| {
+            if (p.kind == .empty) continue;
 
-        assert(stats.total() == patch_requests.items.len);
-        log.info("{}", .{stats});
-        log.info("patched: {}/{}: {:2.2}%", .{
-            stats.successful(),
-            stats.total(),
-            stats.percentage() * 100,
-        });
-        log.info("patchRegion: Finished applying patches", .{});
+            if (p.trampoline_addr != 0 and p.trampoline_len > 0) {
+                try patcher.address_allocator.block(.{
+                    .start = @intCast(p.trampoline_addr),
+                    .end = @intCast(p.trampoline_addr + p.trampoline_len),
+                });
+
+                const start_page = mem.alignBackward(u64, p.trampoline_addr, page_size);
+                const end_page = mem.alignForward(u64, p.trampoline_addr + p.trampoline_len, page_size);
+
+                {
+                    var page = start_page;
+                    const prot = posix.PROT.READ | posix.PROT.WRITE;
+                    const flags: posix.MAP = .{
+                        .TYPE = .PRIVATE,
+                        .ANONYMOUS = true,
+                        .FIXED_NOREPLACE = true,
+                    };
+                    while (page < end_page) : (page += page_size) {
+                        const gop = try pages_made_writable.getOrPut(arena, page);
+                        if (gop.found_existing) continue;
+
+                        const ptr: [*]align(page_size) u8 = @ptrFromInt(page);
+                        _ = backend.mmap(ptr, page_size, prot, flags, -1, 0) catch |err| switch (err) {
+                            error.MappingAlreadyExists => {
+                                try backend.mprotect(ptr[0..page_size], prot);
+                            },
+                            else => return err,
+                        };
+                    }
+                }
+
+                const dest: [*]u8 = @ptrFromInt(p.trampoline_addr);
+                @memcpy(dest[0..p.trampoline_len], p.trampoline_bytes[0..p.trampoline_len]);
+            }
+
+            if (p.source_addr != 0 and p.source_len > 0) {
+                const dest: [*]u8 = @ptrFromInt(p.source_addr);
+                @memcpy(dest[0..p.source_len], p.source_bytes[0..p.source_len]);
+            }
+
+            if (p.lock_len > 0) {
+                locked_bytes.setRangeValue(
+                    .{ .start = p.lock_offset, .end = p.lock_offset + p.lock_len },
+                    true,
+                );
+            }
+        }
     }
+
+    var iter = pages_made_writable.keyIterator();
+    const prot = posix.PROT.READ | posix.PROT.EXEC;
+    while (iter.next()) |page_addr| {
+        const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr.*);
+        try backend.mprotect(ptr[0..page_size], prot);
+    }
+
+    log.info("{}", .{stats});
+    log.info("patched: {}/{}: {d:.2}%", .{
+        stats.successful(),
+        stats.total(),
+        stats.percentage() * 100.0,
+    });
+}
+
+pub const Tactic = union(enum) {
+    jump,
+    punning: u8,
+    successor_eviction,
+    neighbor_eviction,
+};
+
+pub const PatchResult = struct {
+    patches: [2]Patch,
+    tactic: Tactic,
+};
+
+/// Informations to "commit" a patch.
+pub const Patch = struct {
+    kind: enum { empty, active } = .empty,
+
+    /// Information for the jump overwrite
+    source_addr: u64 = 0,
+    source_bytes: [15]u8 = undefined,
+    source_len: u8 = 0,
+
+    /// Information for the trampoline
+    trampoline_addr: u64 = 0,
+    trampoline_bytes: [128]u8 = undefined,
+    trampoline_len: u8 = 0,
+
+    /// Offset inside the region to lock so future patches don't touch them.
+    lock_offset: u64 = 0,
+    lock_len: u64 = 0,
+};
+
+fn patchRequest(
+    patcher: *Patcher,
+    /// What to patch.
+    request: PatchRequest,
+    /// Where to patch it.
+    region: []align(page_size) u8,
+    /// Needed to get the size of instructions for the successor and neighbor eviction.
+    instruction_starts: std.DynamicBitSetUnmanaged,
+    /// Needed to not repeatedly patch the same instructions with successor and neighbor eviction.
+    locked_bytes: std.DynamicBitSetUnmanaged,
+) !PatchResult {
+    if (try attemptDirectOrPunning(patcher, request, region, locked_bytes)) |result| {
+        return result;
+    }
+    if (try attemptSuccessorEviction(patcher, request, region, locked_bytes)) |result| {
+        return result;
+    }
+    if (try attemptNeighborEviction(patcher, request, region, instruction_starts, locked_bytes)) |result| {
+        return result;
+    }
+    return error.PatchFailed;
 }
 
 fn attemptDirectOrPunning(
+    patcher: *Patcher,
     request: PatchRequest,
-    arena: mem.Allocator,
-    locked_bytes: *std.DynamicBitSetUnmanaged,
-    pages_made_writable: *std.AutoHashMapUnmanaged(u64, void),
-    stats: *Statistics,
-) !bool {
+    region: []align(page_size) u8,
+    locked_bytes: std.DynamicBitSetUnmanaged,
+) !?PatchResult {
     const flicken: Flicken = if (request.flicken == .nop)
         .{ .name = "nop", .bytes = request.bytes[0..request.size] }
     else
-        flicken_templates.entries.get(@intFromEnum(request.flicken)).value;
+        patcher.flicken_templates.values()[@intFromEnum(request.flicken)];
 
-    var pii = PatchInstructionIterator.init(
-        request.bytes,
-        request.size,
-        flicken.size(),
-    );
-    // TODO: There is a "Ghost Page" edge case here. If `pii.next()` returns a range that
-    // spans multiple pages (Pages A and B), we might successfully mmap Page A but fail to
-    // mmap Page B. The loop will `continue` to the next candidate range, leaving Page A
-    // mapped. While harmless (it becomes an unused executable page), it is technically a
-    // memory leak. A future fix should track "current attempt" pages separately and unmap
-    // them on failure.
-    while (pii.next(.{ .count = 256 })) |allocated_range| {
-        try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(allocated_range));
-        ensureRangeWritable(
-            allocated_range,
-            pages_made_writable,
-        ) catch |err| switch (err) {
-            error.MappingAlreadyExists => continue,
-            else => return err,
-        };
+    const flicken_size = flicken.size(); // bytes.len + 5
+    const source_addr = @intFromPtr(region.ptr) + request.offset;
 
-        applyPatch(
-            request,
-            flicken,
-            allocated_range,
-            pii.num_prefixes,
-        ) catch |err| switch (err) {
-            error.RelocationOverflow => continue,
-            else => return err,
-        };
+    for (0..prefixes.len + 1) |num_prefixes_usize| {
+        const num_prefixes: u8 = @intCast(num_prefixes_usize);
 
-        try address_allocator.block(gpa, allocated_range, 0);
-        const lock_size = jump_rel32_size + pii.num_prefixes;
-        locked_bytes.setRangeValue(
-            .{ .start = request.offset, .end = request.offset + lock_size },
-            true,
-        );
+        // Tactics T1 pads with prefixes. 5 is the size of `jmp rel32`.
+        const lock_size = j_rel32_size + num_prefixes;
+        if (request.offset + lock_size > region.len) continue;
+        if (num_prefixes + 1 > request.size) continue;
 
-        if (request.size >= 5) {
-            // assert(pii.num_prefixes == 0);
-            stats.jump += 1;
-        } else {
-            stats.punning[pii.num_prefixes] += 1;
+        for (0..lock_size) |i| {
+            if (locked_bytes.isSet(request.offset + i)) {
+                return null;
+            }
         }
-        return true;
+
+        // Construct bitwise constraint if our jump spills over the instruction bounds
+        var mask: u32 = 0;
+        var pattern: u32 = 0;
+        for (0..4) |i| {
+            const byte_offset = num_prefixes + 1 + i;
+            if (byte_offset >= request.size) {
+                const existing_byte = request.bytes[byte_offset];
+                mask |= @as(u32, 0xFF) << @intCast(i * 8);
+                pattern |= @as(u32, existing_byte) << @intCast(i * 8);
+            }
+        }
+
+        const jump_source = source_addr + num_prefixes + j_rel32_size;
+
+        const alloc_request = AddressAllocator.Request{
+            .source = jump_source,
+            .size = flicken_size,
+            .valid_range = .{
+                // TODO: calculate from flicken size
+                // TODO: use relocation information if needed
+                .start = @max(0, @as(i64, @intCast(source_addr)) - 0x7FFF0000), // ~2GB
+                .end = @as(i64, @intCast(source_addr)) + 0x7FFF0000,
+            },
+            .mask = mask,
+            .pattern = pattern,
+        };
+
+        const tramp_range = patcher.address_allocator.findAllocation(alloc_request) orelse continue;
+        var patch = Patch{ .kind = .active };
+
+        // Populate Trampoline
+        patch.trampoline_addr = @intCast(tramp_range.start);
+        patch.trampoline_len = @intCast(flicken_size);
+        @memcpy(patch.trampoline_bytes[0..flicken.bytes.len], flicken.bytes);
+
+        // Relocate if NOP
+        if (request.flicken == .nop) {
+            const instr = dis.disassembleInstruction(request.bytes[0..request.size]).?;
+            const reloc_info = reloc.RelocInfo{
+                .instr = instr,
+                .old_addr = source_addr,
+            };
+            reloc.relocateInstruction(
+                reloc_info.instr,
+                patch.trampoline_addr,
+                patch.trampoline_bytes[0..flicken.bytes.len],
+            ) catch |err| switch (err) {
+                // TODO: when we use relocation information to restrict the range for the request
+                // this shouldn't happen anymore.
+                error.RelocationOverflow => continue, // try next prefix/hole
+                else => return err,
+            };
+        }
+
+        // Jump back from trampoline to original stream
+        const ret_addr = source_addr + request.size;
+        const tramp_jump_source = patch.trampoline_addr + flicken.bytes.len + j_rel32_size;
+        const tramp_disp: i32 = @intCast(@as(i64, @intCast(ret_addr)) - @as(i64, @intCast(tramp_jump_source)));
+
+        patch.trampoline_bytes[flicken.bytes.len] = j_rel32;
+        mem.writeInt(i32, patch.trampoline_bytes[flicken.bytes.len + 1 ..][0..4], tramp_disp, .little);
+
+        // Populate Source Jump
+        patch.source_addr = source_addr;
+        patch.source_len = @intCast(@max(request.size, lock_size));
+        @memset(patch.source_bytes[0..patch.source_len], int3); // Clean padding
+
+        if (num_prefixes > 0) {
+            @memcpy(patch.source_bytes[0..num_prefixes], prefixes[0..num_prefixes]);
+        }
+        patch.source_bytes[num_prefixes] = j_rel32;
+        const source_disp: i32 = @intCast(tramp_range.start - @as(i64, @intCast(jump_source)));
+        mem.writeInt(i32, patch.source_bytes[num_prefixes + 1 ..][0..4], source_disp, .little);
+
+        patch.lock_offset = request.offset;
+        patch.lock_len = lock_size;
+
+        const tactic: Tactic = if (num_prefixes == 0 and request.size >= 5)
+            .jump
+        else
+            .{ .punning = num_prefixes };
+        return .{ .patches = .{ patch, .{} }, .tactic = tactic };
     }
-    return false;
+    return null;
+}
+
+test "attemptDirectOrPunning - Direct Jump (>= 5 bytes)" {
+    var patcher = try Patcher.init(testing.allocator);
+    defer patcher.deinit();
+
+    // Simulate code memory at a known location
+    var region: [1024]u8 align(page_size) = undefined;
+    @memset(&region, nop);
+    // Put a 5-byte instruction at offset 0: mov eax, 1 (B8 01 00 00 00)
+    const instr = "\xB8\x01\x00\x00\x00";
+    @memcpy(region[0..instr.len], instr);
+
+    const source_addr = @intFromPtr(&region);
+
+    // Block everything except a hole at offset 0x2000
+    try patcher.address_allocator.block(.{ .start = 0, .end = @intCast(source_addr + 0x2000) });
+    try patcher.address_allocator.block(.{
+        .start = @intCast(source_addr + 0x3000),
+        .end = @intCast(source_addr + 0x10000000),
+    });
+
+    const request = PatchRequest{
+        .flicken = .nop,
+        .offset = 0,
+        .size = instr.len,
+        .bytes = region[0..],
+    };
+
+    var locked_bytes = try std.DynamicBitSetUnmanaged.initEmpty(testing.allocator, region.len);
+    defer locked_bytes.deinit(testing.allocator);
+
+    const patch_opt = try attemptDirectOrPunning(&patcher, request, &region, locked_bytes);
+    try testing.expect(patch_opt != null);
+    const patch = patch_opt.?.patches[0];
+
+    try testing.expectEqual(.active, patch.kind);
+
+    try testing.expectEqual(source_addr, patch.source_addr);
+    try testing.expectEqual(5, patch.source_len);
+    try testing.expectEqual(0xE9, patch.source_bytes[0]);
+
+    try testing.expectEqual(source_addr + 0x2000, patch.trampoline_addr);
+
+    // Trampoline bytes should be [B8 01 00 00 00][E9 xx xx xx xx]
+    try testing.expectEqual(instr.len + 5, patch.trampoline_len);
+    try testing.expectEqualSlices(u8, instr, patch.trampoline_bytes[0..5]);
+    try testing.expectEqual(0xE9, patch.trampoline_bytes[5]);
+}
+
+test "attemptDirectOrPunning - Punning (< 5 bytes)" {
+    var patcher = try Patcher.init(testing.allocator);
+    defer patcher.deinit();
+
+    var region: [1024]u8 align(page_size) = undefined;
+    @memset(&region, nop);
+    // Put a 2-byte instruction at offset 0: xor eax, eax (31 C0)
+    // Followed by 3 bytes of a successor we MUST pun into: 0xAA 0xBB 0xCC
+    const instr = "\x31\xC0\x11\x22\x33";
+    @memcpy(region[0..instr.len], instr);
+    const target_addr = @intFromPtr(&region) + 5 + 0x33221100;
+
+    try patcher.address_allocator.block(.{ .start = 0, .end = @intCast(target_addr) });
+    try patcher.address_allocator.block(.{
+        .start = @intCast(target_addr + 100),
+        .end = math.maxInt(i64),
+    });
+
+    const request = PatchRequest{
+        .flicken = .nop,
+        .offset = 0,
+        .size = 2,
+        .bytes = region[0..],
+    };
+
+    var locked_bytes = try std.DynamicBitSetUnmanaged.initEmpty(testing.allocator, region.len);
+    defer locked_bytes.deinit(testing.allocator);
+
+    const patch_opt = try attemptDirectOrPunning(&patcher, request, &region, locked_bytes);
+    try testing.expect(patch_opt != null);
+
+    const p = patch_opt.?.patches[0];
+
+    try testing.expectEqual(5, p.source_len); // 5 bytes overwritten
+    try testing.expectEqual(0xE9, p.source_bytes[0]);
+
+    // The jump offset MUST exactly match the 3 bytes we spilled into!
+    try testing.expectEqual(0x11, p.source_bytes[2]);
+    try testing.expectEqual(0x22, p.source_bytes[3]);
+    try testing.expectEqual(0x33, p.source_bytes[4]);
+    try testing.expectEqual(target_addr, p.trampoline_addr);
 }
 
 fn attemptSuccessorEviction(
+    patcher: *Patcher,
     request: PatchRequest,
-    arena: mem.Allocator,
-    locked_bytes: *std.DynamicBitSetUnmanaged,
-    pages_made_writable: *std.AutoHashMapUnmanaged(u64, void),
-    stats: *Statistics,
-) !bool {
-    // Disassemble Successor and create request and flicken for it.
-    const succ_instr = dis.disassembleInstruction(request.bytes[request.size..]) orelse return false;
-    const succ_request = PatchRequest{
-        .flicken = .nop,
-        .size = succ_instr.instruction.length,
-        .bytes = request.bytes[request.size..],
-        .offset = request.offset + request.size,
-    };
-    const succ_flicken = Flicken{
-        .name = "nop",
-        .bytes = succ_request.bytes[0..succ_request.size],
-    };
+    region: []align(page_size) u8,
+    locked_bytes: std.DynamicBitSetUnmanaged,
+) !?PatchResult {
+    const k = request.size;
+    assert(k < 5);
+    assert(k > 0);
 
-    for (0..succ_request.size) |i| {
-        if (locked_bytes.isSet(succ_request.offset + i)) return false;
+    const source_addr = @intFromPtr(region.ptr) + request.offset;
+    const succ_offset = request.offset + k;
+    if (succ_offset >= region.len) return null;
+
+    // Disassemble the Successor Instruction
+    const succ_instr_bundle = dis.disassembleInstruction(region[succ_offset..]) orelse return null;
+    const succ_size = succ_instr_bundle.instruction.length;
+
+    // The total physical bytes we will overwrite.
+    // k + 5 covers both jumps. We may need to pad up to the end of the successor.
+    const lock_size = @max(k + 5, k + succ_size);
+    if (request.offset + lock_size > region.len) return null;
+
+    for (0..lock_size) |i| {
+        if (locked_bytes.isSet(request.offset + i)) {
+            return null;
+        }
     }
 
-    // Save original bytes for reverting the change.
-    var succ_orig_bytes: [15]u8 = undefined;
-    @memcpy(
-        succ_orig_bytes[0..succ_request.size],
-        succ_request.bytes[0..succ_request.size],
-    );
+    const flicken: Flicken = if (request.flicken == .nop)
+        .{ .name = "nop", .bytes = request.bytes[0..request.size] }
+    else
+        patcher.flicken_templates.values()[@intFromEnum(request.flicken)];
+    const flicken_size = flicken.size();
 
-    var succ_pii = PatchInstructionIterator.init(
-        succ_request.bytes,
-        succ_request.size,
-        succ_flicken.size(),
-    );
-    while (succ_pii.next(.{ .count = 16 })) |succ_range| {
-        // Ensure bytes match original before retry.
-        assert(mem.eql(
-            u8,
-            succ_request.bytes[0..succ_request.size],
-            succ_orig_bytes[0..succ_request.size],
-        ));
+    const succ_flicken = Flicken{
+        .name = "nop",
+        .bytes = region[succ_offset .. succ_offset + succ_size],
+    };
+    const succ_flicken_size = succ_flicken.size();
 
-        try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(succ_range));
-        ensureRangeWritable(
-            succ_range,
-            pages_made_writable,
+    const jump_source1 = source_addr + j_rel32_size;
+    const jump_source2 = source_addr + k + j_rel32_size;
+
+    // If the successor jump (5 bytes) spills over the successor instruction bounds, we must
+    // constrain R2 to not corrupt the instruction after the successor.
+    var r2_mask: u32 = 0;
+    var r2_pattern: u32 = 0;
+    for (0..4) |i| {
+        if (1 + i >= succ_size) {
+            const existing_byte = region[succ_offset + 1 + i];
+            r2_mask |= @as(u32, 0xFF) << @intCast(i * 8);
+            r2_pattern |= @as(u32, existing_byte) << @intCast(i * 8);
+        }
+    }
+
+    // Both requests look in the ~2GB window.
+    // TODO: Adjust window using RIP-relative relocation information
+    const window: i64 = 0x7FFF0000;
+    const valid_range1 = Range{
+        .start = @max(0, @as(i64, @intCast(jump_source1)) - window),
+        .end = @as(i64, @intCast(jump_source1)) + window,
+    };
+    const valid_range2 = Range{
+        .start = @max(0, @as(i64, @intCast(jump_source2)) - window),
+        .end = @as(i64, @intCast(jump_source2)) + window,
+    };
+
+    const r1 = AddressAllocator.Request{
+        .source = jump_source1,
+        .size = flicken_size,
+        .valid_range = valid_range1,
+        .mask = 0,
+        .pattern = 0,
+    };
+    const r2 = AddressAllocator.Request{
+        .source = jump_source2,
+        .size = succ_flicken_size,
+        .valid_range = valid_range2,
+        .mask = r2_mask,
+        .pattern = r2_pattern,
+    };
+
+    const coupled_alloc = patcher.address_allocator.findCoupledAllocation(k, r1, r2) orelse return null;
+    const tramp1_range = coupled_alloc[0];
+    const tramp2_range = coupled_alloc[1];
+
+    var patch1 = Patch{ .kind = .active };
+    var patch2 = Patch{ .kind = .active };
+
+    // Populate Successor Trampoline
+    patch2.trampoline_addr = @intCast(tramp2_range.start);
+    patch2.trampoline_len = @intCast(succ_flicken_size);
+    @memcpy(patch2.trampoline_bytes[0..succ_size], succ_flicken.bytes);
+
+    const reloc_info2 = reloc.RelocInfo{
+        .instr = succ_instr_bundle,
+        .old_addr = source_addr + k,
+    };
+    reloc.relocateInstruction(
+        reloc_info2.instr,
+        patch2.trampoline_addr,
+        patch2.trampoline_bytes[0..succ_size],
+    ) catch |err| switch (err) {
+        error.RelocationOverflow => return null,
+        else => return err,
+    };
+
+    const tramp2_jump_source = patch2.trampoline_addr + succ_size + j_rel32_size;
+    const tramp2_disp: i32 = @intCast(@as(i64, @intCast(source_addr + k + succ_size)) - @as(i64, @intCast(tramp2_jump_source)));
+    patch2.trampoline_bytes[succ_size] = j_rel32;
+    mem.writeInt(i32, patch2.trampoline_bytes[succ_size + 1 ..][0..4], tramp2_disp, .little);
+
+    // Populate Original Trampoline and Source Replacements
+    patch1.trampoline_addr = @intCast(tramp1_range.start);
+    patch1.trampoline_len = @intCast(flicken_size);
+    @memcpy(patch1.trampoline_bytes[0..flicken.bytes.len], flicken.bytes);
+
+    if (request.flicken == .nop) {
+        const instr_bundle = dis.disassembleInstruction(request.bytes[0..k]).?;
+        const reloc_info1 = reloc.RelocInfo{
+            .instr = instr_bundle,
+            .old_addr = source_addr,
+        };
+        reloc.relocateInstruction(
+            reloc_info1.instr,
+            patch1.trampoline_addr,
+            patch1.trampoline_bytes[0..flicken.bytes.len],
         ) catch |err| switch (err) {
-            error.MappingAlreadyExists => continue,
+            error.RelocationOverflow => return null,
             else => return err,
         };
+    }
 
-        applyPatch(
-            succ_request,
-            succ_flicken,
-            succ_range,
-            succ_pii.num_prefixes,
-        ) catch |err| switch (err) {
-            error.RelocationOverflow => continue,
-            else => return err,
-        };
+    // T1 returns to the Successor's jump (which is at source_addr + k)
+    const tramp1_jump_source: i64 = @intCast(patch1.trampoline_addr + flicken.bytes.len + j_rel32_size);
+    const tramp1_disp: i32 = @intCast(@as(i64, @intCast(source_addr + k)) -
+        @as(i64, @intCast(tramp1_jump_source)));
+    patch1.trampoline_bytes[flicken.bytes.len] = j_rel32;
+    mem.writeInt(i32, patch1.trampoline_bytes[flicken.bytes.len + 1 ..][0..4], tramp1_disp, .little);
 
-        // Now that the successor is patched, we can patch the original request.
-        const flicken: Flicken = if (request.flicken == .nop)
-            .{ .name = "nop", .bytes = request.bytes[0..request.size] }
-        else
-            flicken_templates.entries.get(@intFromEnum(request.flicken)).value;
+    // Populate the overlapping jumps in the original code stream
+    // Because they physically overlap, Patch 1 handles both J1 and J2 writing.
+    patch1.source_addr = source_addr;
+    patch1.source_len = @intCast(lock_size);
+    @memset(patch1.source_bytes[0..lock_size], int3);
 
-        var orig_pii = PatchInstructionIterator.init(
-            request.bytes,
-            request.size,
-            flicken.size(),
-        );
-        while (orig_pii.next(.{ .count = 16 })) |orig_range| {
-            if (succ_range.touches(orig_range)) continue;
-            try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(orig_range));
-            ensureRangeWritable(
-                orig_range,
-                pages_made_writable,
-            ) catch |err| switch (err) {
-                error.MappingAlreadyExists => continue,
-                else => return err,
+    // Write Successor Jump First
+    patch1.source_bytes[k] = j_rel32;
+    const rel2: i32 = @intCast(tramp2_range.start - @as(i64, @intCast(jump_source2)));
+    mem.writeInt(i32, patch1.source_bytes[k + 1 ..][0..4], rel2, .little);
+
+    // Write Original Jump Over The Top
+    patch1.source_bytes[0] = j_rel32;
+    const rel1: i32 = @intCast(tramp1_range.start - @as(i64, @intCast(jump_source1)));
+    mem.writeInt(i32, patch1.source_bytes[1..][0..4], rel1, .little);
+
+    patch1.lock_offset = request.offset;
+    patch1.lock_len = lock_size;
+
+    return .{ .patches = .{ patch1, patch2 }, .tactic = .successor_eviction };
+}
+
+test "attemptSuccessorEviction - K=2" {
+    var patcher = try Patcher.init(testing.allocator);
+    defer patcher.deinit();
+
+    var region: [1024]u8 align(page_size) = undefined;
+    @memset(&region, nop);
+
+    // Instruction 1 (J1): xor eax, eax (31 C0) -> 2 bytes
+    // Instruction 2 (J2): mov eax, 1 (B8 01 00 00 00) -> 5 bytes
+    const instr = "\x31\xC0\xB8\x01\x00\x00\x00";
+    @memcpy(region[0..instr.len], instr);
+
+    const request = PatchRequest{
+        .flicken = .nop,
+        .offset = 0,
+        .size = 2,
+        .bytes = region[0..],
+    };
+
+    const source_addr = @intFromPtr(&region);
+
+    // We block the immediate area to force the solver to search for a coupled solution.
+    try patcher.address_allocator.block(.{ .start = 0, .end = @intCast(source_addr + 0x2000) });
+
+    var locked_bytes = try std.DynamicBitSetUnmanaged.initEmpty(testing.allocator, region.len);
+    defer locked_bytes.deinit(testing.allocator);
+
+    var instruction_starts = try std.DynamicBitSetUnmanaged.initEmpty(testing.allocator, region.len);
+    defer instruction_starts.deinit(testing.allocator);
+    instruction_starts.set(0);
+    instruction_starts.set(2);
+
+    const patches_opt = try attemptSuccessorEviction(&patcher, request, &region, locked_bytes);
+    try testing.expect(patches_opt != null);
+    const patches = patches_opt.?.patches;
+
+    try testing.expectEqual(.active, patches[0].kind);
+    try testing.expectEqual(.active, patches[1].kind);
+
+    const p1 = patches[0];
+    try testing.expectEqual(source_addr, p1.source_addr);
+
+    // k=2, succ_size=5 -> lock_size = max(2+5, 2+5) = 7
+    try testing.expectEqual(7, p1.source_len);
+
+    // Verify mathematical overlap worked
+    try testing.expectEqual(0xE9, p1.source_bytes[0]); // J1 Opcode
+    try testing.expectEqual(0xE9, p1.source_bytes[2]); // J2 Opcode is perfectly preserved!
+
+    const rel1 = mem.readInt(i32, p1.source_bytes[1..5], .little);
+    const rel2 = mem.readInt(i32, p1.source_bytes[3..7], .little);
+
+    // The top 2 bytes of rel1 MUST exactly match the bottom 2 bytes of rel2
+    const u_rel1: u32 = @bitCast(rel1);
+    const u_rel2: u32 = @bitCast(rel2);
+    try testing.expectEqual((u_rel1 >> 16) & 0xFFFF, u_rel2 & 0xFFFF);
+}
+
+fn attemptNeighborEviction(
+    patcher: *Patcher,
+    request: PatchRequest,
+    region: []align(page_size) u8,
+    instruction_starts: std.DynamicBitSetUnmanaged,
+    locked_bytes: std.DynamicBitSetUnmanaged,
+) !?PatchResult {
+    // Neighbor Eviction requires at least 2 bytes for the short jump (0xEB <disp>)
+    if (request.size < 2) return null;
+
+    const source_addr = @intFromPtr(region.ptr) + request.offset;
+    const start_offset = request.offset + 2;
+    // Valid short jump displacement is [-128, 127]. We only look forward to avoid evicting
+    // instructions we haven't patched yet.
+    const end_offset = @min(start_offset + 128, region.len);
+
+    const flicken: Flicken = if (request.flicken == .nop)
+        .{ .name = "nop", .bytes = request.bytes[0..request.size] }
+    else
+        patcher.flicken_templates.values()[@intFromEnum(request.flicken)];
+    const flicken_size = flicken.size();
+
+    neighbor: for (start_offset..end_offset) |neighbor_offset| {
+        if (!instruction_starts.isSet(neighbor_offset)) continue;
+
+        const victim_bytes_all = region[neighbor_offset..];
+        const victim_instr_bundle = dis.disassembleInstruction(victim_bytes_all) orelse continue;
+        const victim_size = victim_instr_bundle.instruction.length;
+
+        for (0..victim_size) |i| {
+            if (locked_bytes.isSet(neighbor_offset + i)) continue :neighbor;
+        }
+
+        const neighbor_addr = source_addr + (neighbor_offset - request.offset);
+
+        // Try to split the victim instruction at offset `k`
+        var k: u8 = 1;
+        while (k < victim_size) : (k += 1) {
+            const victim_lock_size = @max(victim_size, k + j_rel32_size);
+            if (neighbor_offset + victim_lock_size > region.len) continue;
+
+            // Calculate short jump displacement (from end of original instruction to J_P)
+            const target_offset: i64 = @intCast(neighbor_offset + k);
+            const source_end_offset: i64 = @intCast(request.offset + 2);
+            const disp = target_offset - source_end_offset;
+            if (disp > 127 or disp < -128) continue;
+
+            // Ensure our J_P spill doesn't corrupt already locked bytes
+            for (victim_size..victim_lock_size) |i| {
+                if (locked_bytes.isSet(neighbor_offset + i)) continue;
+            }
+
+            // Build constraint for J_P (the Patch jump)
+            var rp_mask: u32 = 0;
+            var rp_pattern: u32 = 0;
+            for (0..4) |i| {
+                const byte_offset = k + 1 + i;
+                if (byte_offset >= victim_size) {
+                    const existing_byte = region[neighbor_offset + byte_offset];
+                    rp_mask |= @as(u32, 0xFF) << @intCast(i * 8);
+                    rp_pattern |= @as(u32, existing_byte) << @intCast(i * 8);
+                }
+            }
+
+            const jump_source_V = neighbor_addr + j_rel32_size;
+            const jump_source_P = neighbor_addr + k + j_rel32_size;
+
+            // Look in the ~2GB window
+            const window: i64 = 0x7FFF0000;
+            const r_V = AddressAllocator.Request{
+                .source = jump_source_V,
+                .size = victim_size + j_rel32_size,
+                .valid_range = .{
+                    .start = @max(0, @as(i64, @intCast(jump_source_V)) - window),
+                    .end = @as(i64, @intCast(jump_source_V)) + window,
+                },
+                .mask = 0,
+                .pattern = 0,
+            };
+            const r_P = AddressAllocator.Request{
+                .source = jump_source_P,
+                .size = flicken_size,
+                .valid_range = .{
+                    .start = @max(0, @as(i64, @intCast(jump_source_P)) - window),
+                    .end = @as(i64, @intCast(jump_source_P)) + window,
+                },
+                .mask = rp_mask,
+                .pattern = rp_pattern,
             };
 
-            applyPatch(
-                request,
-                flicken,
-                orig_range,
-                orig_pii.num_prefixes,
+            const coupled_alloc = patcher.address_allocator.findCoupledAllocation(k, r_V, r_P) orelse continue;
+            const tramp_V_range = coupled_alloc[0];
+            const tramp_P_range = coupled_alloc[1];
+
+            var patch1 = Patch{ .kind = .active };
+            var patch2 = Patch{ .kind = .active };
+
+            // Patch 1: Original Short Jump + Flicken Trampoline
+            patch1.source_addr = source_addr;
+            patch1.source_len = request.size;
+            @memset(patch1.source_bytes[0..patch1.source_len], int3);
+            patch1.source_bytes[0] = j_rel8;
+            patch1.source_bytes[1] = @intCast(disp);
+
+            patch1.trampoline_addr = @intCast(tramp_P_range.start);
+            patch1.trampoline_len = @intCast(flicken_size);
+            @memcpy(patch1.trampoline_bytes[0..flicken.bytes.len], flicken.bytes);
+
+            if (request.flicken == .nop) {
+                const reloc_info_p = reloc.RelocInfo{
+                    .instr = dis.disassembleInstruction(request.bytes[0..request.size]).?,
+                    .old_addr = source_addr,
+                };
+                reloc.relocateInstruction(
+                    reloc_info_p.instr,
+                    patch1.trampoline_addr,
+                    patch1.trampoline_bytes[0..flicken.bytes.len],
+                ) catch |err| switch (err) {
+                    error.RelocationOverflow => continue,
+                    else => return err,
+                };
+            }
+
+            const tramp_P_jump_source = patch1.trampoline_addr + flicken.bytes.len + j_rel32_size;
+            const tramp_P_disp: i32 = @intCast(@as(i64, @intCast(source_addr + request.size)) - @as(i64, @intCast(tramp_P_jump_source)));
+            patch1.trampoline_bytes[flicken.bytes.len] = j_rel32;
+            mem.writeInt(i32, patch1.trampoline_bytes[flicken.bytes.len + 1 ..][0..4], tramp_P_disp, .little);
+
+            patch1.lock_offset = request.offset;
+            patch1.lock_len = request.size;
+
+            // Patch 2: Victim Coupled Jump + Victim Trampoline
+            patch2.source_addr = neighbor_addr;
+            patch2.source_len = @intCast(victim_lock_size);
+            @memset(patch2.source_bytes[0..patch2.source_len], int3);
+
+            // Write J_P (The jump targeted by our short jump) at offset k
+            patch2.source_bytes[k] = j_rel32;
+            const rel_P: i32 = @intCast(tramp_P_range.start - @as(i64, @intCast(jump_source_P)));
+            mem.writeInt(i32, patch2.source_bytes[k + 1 ..][0..4], rel_P, .little);
+
+            // Write J_V (The victim's jump) at offset 0
+            patch2.source_bytes[0] = j_rel32;
+            const rel_V: i32 = @intCast(tramp_V_range.start - @as(i64, @intCast(jump_source_V)));
+            mem.writeInt(i32, patch2.source_bytes[1..][0..4], rel_V, .little);
+
+            patch2.trampoline_addr = @intCast(tramp_V_range.start);
+            patch2.trampoline_len = @intCast(victim_size + j_rel32_size);
+            @memcpy(patch2.trampoline_bytes[0..victim_size], victim_bytes_all[0..victim_size]);
+
+            const reloc_info_v = reloc.RelocInfo{
+                .instr = victim_instr_bundle,
+                .old_addr = neighbor_addr,
+            };
+            reloc.relocateInstruction(
+                reloc_info_v.instr,
+                patch2.trampoline_addr,
+                patch2.trampoline_bytes[0..victim_size],
             ) catch |err| switch (err) {
                 error.RelocationOverflow => continue,
                 else => return err,
             };
 
-            try address_allocator.block(gpa, succ_range, 0);
-            try address_allocator.block(gpa, orig_range, 0);
-            const lock_size = request.size + jump_rel32_size + succ_pii.num_prefixes;
-            locked_bytes.setRangeValue(
-                .{ .start = request.offset, .end = request.offset + lock_size },
-                true,
-            );
-            stats.successor_eviction += 1;
-            return true;
-        }
+            const tramp_V_jump_source = patch2.trampoline_addr + victim_size + j_rel32_size;
+            const tramp_V_disp: i32 = @intCast(@as(i64, @intCast(neighbor_addr + victim_size)) - @as(i64, @intCast(tramp_V_jump_source)));
+            patch2.trampoline_bytes[victim_size] = j_rel32;
+            mem.writeInt(i32, patch2.trampoline_bytes[victim_size + 1 ..][0..4], tramp_V_disp, .little);
 
-        // We couldn't patch with the bytes. So revert to original ones.
-        @memcpy(
-            succ_request.bytes[0..succ_request.size],
-            succ_orig_bytes[0..succ_request.size],
-        );
-    }
-    return false;
-}
+            patch2.lock_offset = neighbor_offset;
+            patch2.lock_len = victim_lock_size;
 
-fn attemptNeighborEviction(
-    request: PatchRequest,
-    arena: mem.Allocator,
-    locked_bytes: *std.DynamicBitSetUnmanaged,
-    pages_made_writable: *std.AutoHashMapUnmanaged(u64, void),
-    instruction_starts: *const std.DynamicBitSetUnmanaged,
-    stats: *Statistics,
-) !bool {
-    // Valid neighbors must be within [-128, 127] range for a short jump.
-    // Since we patch back-to-front, we only look at neighbors *after* the current instruction
-    // (higher address) to avoid evicting an instruction we haven't processed/patched yet.
-    const start_offset = request.offset + 2;
-    const end_offset = @min(
-        start_offset + 128,
-        request.bytes.len + request.offset,
-    );
-
-    neighbor: for (start_offset..end_offset) |neighbor_offset| {
-        if (!instruction_starts.isSet(neighbor_offset)) continue;
-
-        const victim_bytes_all = request.bytes[neighbor_offset - request.offset ..];
-
-        // PERF: We could also search for the next set bit in instruction_starts
-        const victim_instr = dis.disassembleInstruction(victim_bytes_all) orelse continue;
-        const victim_size = victim_instr.instruction.length;
-        const victim_bytes = victim_bytes_all[0..victim_size];
-
-        for (0..victim_size) |i| {
-            if (locked_bytes.isSet(neighbor_offset + i)) {
-                continue :neighbor;
-            }
-        }
-
-        // Save original bytes to revert if constraints cannot be solved.
-        var victim_orig_bytes: [15]u8 = undefined;
-        @memcpy(victim_orig_bytes[0..victim_size], victim_bytes);
-
-        // OUTER LOOP: J_Patch
-        // Iterate possible offsets 'k' inside the victim for the patch jump.
-        var k: u8 = 1;
-        while (k < victim_size) : (k += 1) {
-            const target: i64 = @intCast(neighbor_offset + k);
-            const source: i64 = @intCast(request.offset + 2);
-            const disp = target - source;
-            if (disp > 127 or disp < -128) continue;
-
-            const patch_flicken: Flicken = if (request.flicken == .nop)
-                .{ .name = "nop", .bytes = request.bytes[0..request.size] }
-            else
-                flicken_templates.entries.get(@intFromEnum(request.flicken)).value;
-
-            // Constraints for J_Patch:
-            // Bytes [0 .. victim_size - k] are free (inside victim).
-            // Bytes [victim_size - k .. ] are used (outside victim, immutable).
-            var patch_pii = PatchInstructionIterator.init(
-                victim_bytes_all[k..],
-                @intCast(victim_size - k),
-                patch_flicken.size(),
-            );
-
-            while (patch_pii.next(.{ .count = 16 })) |patch_range| {
-                // J_Patch MUST NOT use prefixes, because it's punned inside J_Victim.
-                // Adding prefixes would shift J_Patch relative to J_Victim, making constraints harder.
-                if (patch_pii.num_prefixes > 0) break;
-
-                try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(patch_range));
-                ensureRangeWritable(patch_range, pages_made_writable) catch |err| switch (err) {
-                    error.MappingAlreadyExists => continue,
-                    else => return err,
-                };
-
-                // Tentatively write J_Patch to memory to set constraints for J_Victim.
-                // We only need to write the bytes of J_Patch that land inside the victim.
-                {
-                    const jmp_target = patch_range.start;
-                    const jmp_source: i64 = @intCast(@intFromPtr(&victim_bytes_all[k]) + 5);
-                    const rel32: i32 = @intCast(jmp_target - jmp_source);
-                    victim_bytes_all[k] = jump_rel32;
-                    mem.writeInt(i32, victim_bytes_all[k + 1 ..][0..4], rel32, .little);
-                }
-
-                // INNER LOOP: J_Victim
-                // Constraints:
-                // Bytes [0 .. k] are free (before J_Patch).
-                // Bytes [k .. ] are used (overlap J_Patch).
-                const victim_flicken = Flicken{
-                    .name = "nop",
-                    .bytes = victim_orig_bytes[0..victim_size],
-                };
-
-                var victim_pii = PatchInstructionIterator.init(
-                    victim_bytes_all,
-                    k,
-                    victim_flicken.size(),
-                );
-
-                while (victim_pii.next(.{ .count = 16 })) |victim_range| {
-                    if (patch_range.touches(victim_range)) continue;
-
-                    try pages_made_writable.ensureUnusedCapacity(arena, touchedPageCount(victim_range));
-                    ensureRangeWritable(victim_range, pages_made_writable) catch |err| switch (err) {
-                        error.MappingAlreadyExists => continue,
-                        else => return err,
-                    };
-
-                    // SUCCESS! Commit everything.
-
-                    // 1. Write Patch Trampoline (J_Patch target)
-                    {
-                        const trampoline: [*]u8 = @ptrFromInt(patch_range.getStart(u64));
-                        var reloc_info: ?RelocInfo = null;
-                        if (request.flicken == .nop) {
-                            reloc_info = .{
-                                .instr = dis.disassembleInstruction(patch_flicken.bytes).?,
-                                .old_addr = @intFromPtr(request.bytes.ptr),
-                            };
-                        }
-                        commitTrampoline(
-                            trampoline,
-                            patch_flicken.bytes,
-                            reloc_info,
-                            @intFromPtr(request.bytes.ptr) + request.size,
-                        ) catch |err| switch (err) {
-                            error.RelocationOverflow => continue,
-                            else => return err,
-                        };
-                    }
-
-                    // 2. Write Victim Trampoline (J_Victim target)
-                    {
-                        const trampoline: [*]u8 = @ptrFromInt(victim_range.getStart(u64));
-                        commitTrampoline(
-                            trampoline,
-                            victim_orig_bytes[0..victim_size],
-                            .{
-                                .instr = dis.disassembleInstruction(victim_orig_bytes[0..victim_size]).?,
-                                .old_addr = @intFromPtr(victim_bytes_all.ptr),
-                            },
-                            @intFromPtr(victim_bytes_all.ptr) + victim_size,
-                        ) catch |err| switch (err) {
-                            error.RelocationOverflow => continue,
-                            else => return err,
-                        };
-                    }
-
-                    // 3. Write J_Victim (overwrites head of J_Patch which is fine)
-                    commitJump(
-                        victim_bytes_all.ptr,
-                        @intCast(victim_range.start),
-                        victim_pii.num_prefixes,
-                        k, // Total size for padding is limited to k to preserve J_Patch tail
-                    );
-
-                    // 4. Write J_Short at request
-                    request.bytes[0] = jump_rel8;
-                    request.bytes[1] = @intCast(disp);
-                    if (request.size > 2) {
-                        @memset(request.bytes[2..request.size], int3);
-                    }
-
-                    // 5. Locking
-                    try address_allocator.block(gpa, patch_range, 0);
-                    try address_allocator.block(gpa, victim_range, 0);
-
-                    locked_bytes.setRangeValue(
-                        .{ .start = request.offset, .end = request.offset + request.size },
-                        true,
-                    );
-                    // Lock victim range + any extension of J_Patch
-                    const j_patch_end = neighbor_offset + k + 5;
-                    const lock_end = @max(neighbor_offset + victim_size, j_patch_end);
-                    locked_bytes.setRangeValue(
-                        .{ .start = neighbor_offset, .end = lock_end },
-                        true,
-                    );
-
-                    stats.neighbor_eviction += 1;
-                    return true;
-                }
-
-                // Revert J_Patch write for next iteration
-                @memcpy(victim_bytes, victim_orig_bytes[0..victim_size]);
-            }
+            return PatchResult{ .patches = .{ patch1, patch2 }, .tactic = .neighbor_eviction };
         }
     }
-
-    return false;
+    return null;
 }
 
-/// Applies a standard patch (T1/B1/B2) where the instruction is replaced by a jump to a trampoline.
-///
-/// This handles the logic of writing the trampoline content (including relocation) and
-/// overwriting the original instruction with a `JMP` (plus prefixes/padding).
-fn applyPatch(
-    request: PatchRequest,
-    flicken: Flicken,
-    allocated_range: Range,
-    num_prefixes: u8,
-) !void {
-    const flicken_addr: [*]u8 = @ptrFromInt(allocated_range.getStart(u64));
+test "attemptNeighborEviction - Valid Neighbor Found" {
+    var patcher = try Patcher.init(testing.allocator);
+    defer patcher.deinit();
 
-    // Commit Trampoline
-    var reloc_info: ?RelocInfo = null;
-    if (request.flicken == .nop) {
-        reloc_info = .{
-            .instr = dis.disassembleInstruction(request.bytes[0..request.size]).?,
-            .old_addr = @intFromPtr(request.bytes.ptr),
-        };
-    }
+    var region: [1024]u8 align(page_size) = undefined;
+    @memset(&region, 0);
 
-    const ret_addr = @intFromPtr(request.bytes.ptr) + request.size;
-    try commitTrampoline(flicken_addr, flicken.bytes, reloc_info, ret_addr);
+    // Target (I): xor eax, eax (31 C0) -> 2 bytes [Offset 0]
+    // Padding: NOP NOP (90 90) -> 2 bytes [Offset 2]
+    // Neighbor (N): mov eax, 1 (B8 01 00 00 00) -> 5 bytes [Offset 4]
+    const instr = "\x31\xC0\x90\x90\xB8\x01\x00\x00\x00";
+    @memcpy(region[0..instr.len], instr);
 
-    // Commit Jump (Patch)
-    commitJump(request.bytes.ptr, @intCast(allocated_range.start), num_prefixes, request.size);
-}
+    const source_addr = @intFromPtr(&region);
 
-const RelocInfo = struct {
-    instr: dis.BundledInstruction,
-    old_addr: u64,
-};
-
-/// Helper to write code into a trampoline.
-///
-/// It copies the original bytes (or flicken content), relocates any RIP-relative instructions
-/// to be valid at the new address, and appends a jump back to the instruction stream.
-fn commitTrampoline(
-    trampoline_ptr: [*]u8,
-    content: []const u8,
-    reloc_info: ?RelocInfo,
-    return_addr: u64,
-) !void {
-    @memcpy(trampoline_ptr[0..content.len], content);
-
-    if (reloc_info) |info| {
-        try relocateInstruction(
-            info.instr,
-            @intFromPtr(trampoline_ptr),
-            trampoline_ptr[0..content.len],
-        );
-    }
-
-    // Write jump back
-    trampoline_ptr[content.len] = jump_rel32;
-    const jump_src = @intFromPtr(trampoline_ptr) + content.len + jump_rel32_size;
-    const jump_disp: i32 = @intCast(@as(i64, @intCast(return_addr)) - @as(i64, @intCast(jump_src)));
-    mem.writeInt(i32, trampoline_ptr[content.len + 1 ..][0..4], jump_disp, .little);
-}
-
-/// Helper to overwrite an instruction with a jump to a trampoline.
-///
-/// It handles writing optional prefixes (padding), the `0xE9` opcode, the relative offset,
-/// and fills any remaining bytes of the original instruction with `INT3` to prevent
-/// execution of garbage bytes.
-fn commitJump(
-    from_ptr: [*]u8,
-    to_addr: u64,
-    num_prefixes: u8,
-    total_size: usize,
-) void {
-    const prefixes_slice = from_ptr[0..num_prefixes];
-    @memcpy(prefixes_slice, prefixes[0..num_prefixes]);
-
-    from_ptr[num_prefixes] = jump_rel32;
-
-    const jump_src = @intFromPtr(from_ptr) + num_prefixes + jump_rel32_size;
-    const jump_disp: i32 = @intCast(@as(i64, @intCast(to_addr)) - @as(i64, @intCast(jump_src)));
-    mem.writeInt(i32, from_ptr[num_prefixes + 1 ..][0..4], jump_disp, .little);
-
-    const patch_end_index = num_prefixes + jump_rel32_size;
-    if (patch_end_index < total_size) {
-        @memset(from_ptr[patch_end_index..total_size], int3);
-    }
-}
-
-/// Only used for debugging.
-fn printMaps() !void {
-    const path = "/proc/self/maps";
-    var reader = try std.fs.cwd().openFile(path, .{});
-    var buffer: [1024 * 1024]u8 = undefined;
-    const size = try reader.readAll(&buffer);
-    std.debug.print("\n{s}\n", .{buffer[0..size]});
-}
-
-/// Returns the number of pages that the given range touches.
-fn touchedPageCount(range: Range) u32 {
-    const start_page = mem.alignBackward(u64, range.getStart(u64), page_size);
-    // alignBackward on (end - 1) handles the exclusive upper bound correctly
-    const end_page = mem.alignBackward(u64, range.getEnd(u64) - 1, page_size);
-    return @intCast((end_page - start_page) / page_size + 1);
-}
-
-/// Ensure `range` is mapped R|W. Assumes `pages_made_writable` has enough free capacity.
-fn ensureRangeWritable(
-    range: Range,
-    pages_made_writable: *std.AutoHashMapUnmanaged(u64, void),
-) !void {
-    const start_page = mem.alignBackward(u64, range.getStart(u64), page_size);
-    const end_page = mem.alignBackward(u64, range.getEnd(u64) - 1, page_size);
-    const protection = posix.PROT.READ | posix.PROT.WRITE;
-    var page_addr = start_page;
-    while (page_addr <= end_page) : (page_addr += page_size) {
-        // If the page is already writable, skip it.
-        if (pages_made_writable.get(page_addr)) |_| continue;
-        // If we mapped it already we have to do mprotect, else mmap.
-        const gop = try allocated_pages.getOrPut(gpa, page_addr);
-        if (gop.found_existing) {
-            const ptr: [*]align(page_size) u8 = @ptrFromInt(page_addr);
-            try posix.mprotect(ptr[0..page_size], protection);
-        } else {
-            const addr = posix.mmap(
-                @ptrFromInt(page_addr),
-                page_size,
-                protection,
-                .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = true },
-                -1,
-                0,
-            ) catch |err| switch (err) {
-                error.MappingAlreadyExists => {
-                    // If the mapping exists this means that the someone else
-                    // (executable, OS, dynamic loader,...) allocated something there.
-                    // We block this so we don't try this page again in the future,
-                    // saving a bunch of syscalls.
-                    try address_allocator.block(
-                        gpa,
-                        .{ .start = @intCast(page_addr), .end = @intCast(page_addr + page_size) },
-                        page_size,
-                    );
-                    return err;
-                },
-                else => return err,
-            };
-            assert(@as(u64, @intFromPtr(addr.ptr)) == page_addr);
-            // `gop.value_ptr.* = {};` not needed because it's void.
-        }
-        pages_made_writable.putAssumeCapacityNoClobber(page_addr, {});
-    }
-}
-
-const PatchInstructionIterator = struct {
-    bytes: []const u8, // first byte is first byte of instruction to patch.
-    instruction_size: u8,
-    flicken_size: u64,
-
-    // Internal state
-    num_prefixes: u8,
-    pli: PatchLocationIterator,
-    valid_range: Range,
-    allocated_count: u64,
-
-    fn init(
-        bytes: []const u8,
-        instruction_size: u8,
-        flicken_size: u64,
-    ) PatchInstructionIterator {
-        const patch_bytes = getPatchBytes(bytes, instruction_size, 0);
-        var pli = PatchLocationIterator.init(patch_bytes, @intFromPtr(&bytes[5]));
-        const valid_range = pli.next() orelse Range{ .start = 0, .end = 0 };
-        return .{
-            .bytes = bytes,
-            .instruction_size = instruction_size,
-            .flicken_size = flicken_size,
-            .num_prefixes = 0,
-            .pli = pli,
-            .valid_range = valid_range,
-            .allocated_count = 0,
-        };
-    }
-
-    pub const Strategy = union(enum) {
-        /// Iterates through all possible ranges.
-        /// Useful for finding the optimal allocation (fewest prefixes).
-        exhaustive: void,
-        /// Limits the search to `count` allocation attempts per valid constraint range found by the
-        /// PatchLocationIterator.
-        ///
-        /// This acts as a heuristic to prevent worst-case performance (scanning every byte of a 2GB
-        /// gap) while still offering better density than a purely greedy approach. A count of 1 is
-        /// equivalent to a greedy strategy.
-        count: u64,
+    const request = PatchRequest{
+        .flicken = .nop,
+        .offset = 0,
+        .size = 2,
+        .bytes = region[0..],
     };
 
-    fn next(
-        pii: *PatchInstructionIterator,
-        strategy: Strategy,
-    ) ?Range {
-        const State = enum {
-            allocation,
-            range,
-            prefix,
-        };
-        blk: switch (State.allocation) {
-            .allocation => {
-                if (address_allocator.findAllocation(
-                    pii.flicken_size,
-                    pii.valid_range,
-                )) |allocated_range| {
-                    assert(allocated_range.size() == pii.flicken_size);
-                    pii.allocated_count += 1;
-                    // Advancing the valid range, such that the next call to `findAllocation` won't
-                    // find the same range again.
-                    switch (strategy) {
-                        .exhaustive => pii.valid_range.start = allocated_range.start + 1,
-                        .count => |c| {
-                            if (pii.allocated_count >= c) {
-                                pii.valid_range.start = pii.valid_range.end;
-                                pii.allocated_count = 0;
-                            } else {
-                                pii.valid_range.start = allocated_range.start + 1;
-                            }
-                        },
-                    }
-                    return allocated_range;
-                } else {
-                    pii.allocated_count = 0;
-                    continue :blk .range;
-                }
-            },
-            .range => {
-                // Valid range is used up, so get a new one from the pli.
-                if (pii.pli.next()) |valid_range| {
-                    pii.valid_range = valid_range;
-                    continue :blk .allocation;
-                } else {
-                    continue :blk .prefix;
-                }
-            },
-            .prefix => {
-                if (pii.num_prefixes < @min(pii.instruction_size, prefixes.len)) {
-                    pii.num_prefixes += 1;
-                    const patch_bytes = getPatchBytes(pii.bytes, pii.instruction_size, pii.num_prefixes);
-                    pii.pli = PatchLocationIterator.init(
-                        patch_bytes,
-                        @intFromPtr(&pii.bytes[pii.num_prefixes + 5]),
-                    );
-                    continue :blk .range;
-                } else {
-                    return null;
-                }
-            },
-        }
-        comptime unreachable;
-    }
+    // Block immediate area to trigger the complex coupled solver logic.
+    try patcher.address_allocator.block(.{ .start = 0, .end = @intCast(source_addr + 0x2000) });
 
-    fn getPatchBytes(instruction_bytes: []const u8, instruction_size: u8, num_prefixes: u8) [4]PatchByte {
-        const offset_location = instruction_bytes[num_prefixes + 1 ..][0..4]; // +1 for e9
-        var patch_bytes: [4]PatchByte = undefined;
-        for (&patch_bytes, offset_location, num_prefixes + 1..) |*patch_byte, offset_byte, i| {
-            if (i < instruction_size) {
-                patch_byte.* = .free;
-            } else {
-                patch_byte.* = .{ .used = offset_byte };
-            }
-        }
-        return patch_bytes;
-    }
-};
+    var locked_bytes = try std.DynamicBitSetUnmanaged.initEmpty(testing.allocator, region.len);
+    defer locked_bytes.deinit(testing.allocator);
 
-/// Fixes RIP-relative operands in an instruction that has been moved to a new address.
-fn relocateInstruction(
-    instruction: dis.BundledInstruction,
-    address: u64,
-    buffer: []u8,
-) !void {
-    const instr = instruction.instruction;
-    // Iterate all operands
-    for (0..instr.operand_count) |i| {
-        const operand = &instruction.operands[i];
+    var instruction_starts = try std.DynamicBitSetUnmanaged.initEmpty(testing.allocator, region.len);
+    defer instruction_starts.deinit(testing.allocator);
+    instruction_starts.set(0);
+    instruction_starts.set(2);
+    instruction_starts.set(3);
+    instruction_starts.set(4); // Neighbor starts here
 
-        // Check for RIP-relative memory operand
-        const is_rip_rel = operand.type == zydis.ZYDIS_OPERAND_TYPE_MEMORY and
-            operand.unnamed_0.mem.base == zydis.ZYDIS_REGISTER_RIP;
-        // Check for relative immediate (e.g. JMP rel32)
-        const is_rel_imm = operand.type == zydis.ZYDIS_OPERAND_TYPE_IMMEDIATE and
-            operand.unnamed_0.imm.is_relative == zydis.ZYAN_TRUE;
-        if (!is_rip_rel and !is_rel_imm) continue;
+    const patches_opt = try attemptNeighborEviction(&patcher, request, &region, instruction_starts, locked_bytes);
+    try testing.expect(patches_opt != null);
+    const patches = patches_opt.?.patches;
 
-        // We have to apply a relocation
-        var result_address: u64 = 0;
-        const status = zydis.ZydisCalcAbsoluteAddress(
-            instr,
-            operand,
-            instruction.address,
-            &result_address,
-        );
-        assert(zydis.ZYAN_SUCCESS(status)); // TODO: maybe return an error instead
+    try testing.expectEqual(.active, patches[0].kind);
+    try testing.expectEqual(.active, patches[1].kind);
 
-        // Calculate new displacement relative to the new address
-        // The instruction length remains the same.
-        const next_rip: i64 = @intCast(address + instr.length);
-        const new_disp = @as(i64, @intCast(result_address)) - next_rip;
+    const p1 = patches[0];
+    const p2 = patches[1];
 
-        var offset: u16 = 0;
-        var size_bits: u8 = 0;
+    // Verify Patch 1 (The short jump)
+    try testing.expectEqual(source_addr, p1.source_addr);
+    try testing.expectEqual(2, p1.source_len);
+    try testing.expectEqual(0xEB, p1.source_bytes[0]);
 
-        if (is_rip_rel) {
-            offset = instr.raw.disp.offset;
-            size_bits = instr.raw.disp.size;
-        } else {
-            assert(is_rel_imm);
-            // For relative immediate, find the matching raw immediate.
-            var found = false;
-            for (&instr.raw.imm) |*imm| {
-                if (imm.is_relative == zydis.ZYAN_TRUE) {
-                    offset = imm.offset;
-                    size_bits = imm.size;
-                    found = true;
-                    break;
-                }
-            }
-            assert(found);
-        }
+    // Displacement should jump to the hole created at offset 4.
+    // Short jump origin is end of instruction (offset 2).
+    // Target is `neighbor_offset + k`. Assume it chose k=2 for the overlap: 4 + 2 = 6.
+    // disp = 6 - 2 = 4.
+    const expected_disp = p1.source_bytes[1];
+    const target_offset = 2 + @as(i8, @bitCast(expected_disp));
+    try testing.expect(target_offset > 4 and target_offset < 9);
 
-        assert(offset != 0);
-        assert(size_bits != 0);
-        const size_bytes = size_bits / 8;
+    // Verify Patch 2 (The overlapping jumps in the neighbor's location)
+    try testing.expectEqual(source_addr + 4, p2.source_addr);
+    try testing.expectEqual(0xE9, p2.source_bytes[0]); // J_V starts with 0xE9
 
-        if (offset + size_bytes > buffer.len) {
-            return error.RelocationFail;
-        }
-
-        const fits = switch (size_bits) {
-            8 => new_disp >= math.minInt(i8) and new_disp <= math.maxInt(i8),
-            16 => new_disp >= math.minInt(i16) and new_disp <= math.maxInt(i16),
-            32 => new_disp >= math.minInt(i32) and new_disp <= math.maxInt(i32),
-            64 => true,
-            else => unreachable,
-        };
-
-        if (!fits) {
-            return error.RelocationOverflow;
-        }
-
-        const ptr = buffer[offset..];
-        switch (size_bits) {
-            8 => ptr[0] = @as(u8, @bitCast(@as(i8, @intCast(new_disp)))),
-            16 => mem.writeInt(u16, ptr[0..2], @bitCast(@as(i16, @intCast(new_disp))), .little),
-            32 => mem.writeInt(u32, ptr[0..4], @bitCast(@as(i32, @intCast(new_disp))), .little),
-            64 => mem.writeInt(u64, ptr[0..8], @bitCast(@as(i64, @intCast(new_disp))), .little),
-            else => unreachable,
-        }
-    }
+    const k = target_offset - 4;
+    try testing.expectEqual(0xE9, p2.source_bytes[@intCast(k)]); // J_P starts with 0xE9 exactly where the short jump points!
 }

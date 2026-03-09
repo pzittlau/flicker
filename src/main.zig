@@ -8,6 +8,7 @@ const testing = std.testing;
 
 const log = std.log.scoped(.flicker);
 const Patcher = @import("Patcher.zig");
+const loader = @import("loader.zig");
 
 const assert = std.debug.assert;
 
@@ -16,8 +17,8 @@ pub const std_options: std.Options = .{
     .log_scope_levels = &.{
         .{ .scope = .disassembler, .level = .info },
         .{ .scope = .patcher, .level = .debug },
-        .{ .scope = .patch_location_iterator, .level = .warn },
         .{ .scope = .flicker, .level = .info },
+        .{ .scope = .loader, .level = .info },
     },
 };
 const page_size = std.heap.pageSize();
@@ -31,6 +32,12 @@ const help =
 ;
 
 const UnfinishedReadError = error{UnfinishedRead};
+
+/// This needs to be a public global, such that it has a static memory location. This is needed
+/// for the syscall interception, in particular for patching new maps of the `mmap` call.
+pub var patcher: Patcher = undefined;
+pub var target_exec_path_buf: [std.fs.max_path_bytes]u8 = @splat(0);
+pub var target_exec_path: []const u8 = undefined;
 
 pub fn main() !void {
     // Parse arguments
@@ -51,27 +58,29 @@ pub fn main() !void {
 
     const file = try lookupFile(mem.sliceTo(std.os.argv[arg_index], 0));
 
-    {
-        // Initialize patcher
-        try Patcher.init();
-        // Resolve the absolute path of the target executable. This is needed for the
-        // readlink("/proc/self/exe") interception. We use the file descriptor to get the
-        // authoritative path.
-        var self_buf: [128]u8 = undefined;
-        const fd_path = try std.fmt.bufPrint(&self_buf, "/proc/self/fd/{d}", .{file.handle});
-        Patcher.target_exec_path = try std.fs.readLinkAbsolute(fd_path, &Patcher.target_exec_path_buf);
-        log.debug("Resolved target executable path: {s}", .{Patcher.target_exec_path});
-    }
+    patcher = try .init(std.heap.page_allocator);
+
+    // Resolve the absolute path of the target executable for /proc/self/exe spoofing
+    const fd_path = try std.fmt.bufPrint(&target_exec_path_buf, "/proc/self/fd/{d}", .{file.handle});
+    target_exec_path = try std.fs.readLinkAbsolute(fd_path, &target_exec_path_buf);
+    log.debug("Resolved target executable path: {s}", .{target_exec_path});
+
+    try bootstrapMemoryMap(&patcher);
+    // TODO:
+    // block until `mmap_min_addr`
+    // block all entries in `proc/self/maps`
 
     // Map file into memory
     var file_buffer: [128]u8 = undefined;
     var file_reader = file.reader(&file_buffer);
     log.info("--- Loading executable: {s} ---", .{std.os.argv[arg_index]});
     const ehdr = try elf.Header.read(&file_reader.interface);
-    const base = try loadStaticElf(ehdr, &file_reader);
+    const load_result = try loader.loadStaticElf(ehdr, &file_reader);
+    const base = load_result.base;
     const entry = ehdr.entry + if (ehdr.type == .DYN) base else 0;
     log.info("Executable loaded: base=0x{x}, entry=0x{x}", .{ base, entry });
-    try patchLoadedElf(base);
+    try patcher.address_allocator.block(.fromPtr(@ptrFromInt(base), load_result.size));
+    try patchLoadedElf(load_result.base);
 
     // Check for dynamic linker
     var maybe_interp_base: ?usize = null;
@@ -96,13 +105,15 @@ pub fn main() !void {
         var interp_reader = interp.reader(&interp_buffer);
         const interp_ehdr = try elf.Header.read(&interp_reader.interface);
         assert(interp_ehdr.type == elf.ET.DYN);
-        const interp_base = try loadStaticElf(interp_ehdr, &interp_reader);
+        const interp_result = try loader.loadStaticElf(interp_ehdr, &interp_reader);
+        const interp_base = interp_result.base;
         maybe_interp_base = interp_base;
         maybe_interp_entry = interp_ehdr.entry + if (interp_ehdr.type == .DYN) interp_base else 0;
         log.info(
             "Interpreter loaded: base=0x{x}, entry=0x{x}",
             .{ interp_base, maybe_interp_entry.? },
         );
+        try patcher.address_allocator.block(.fromPtr(@ptrFromInt(interp_base), interp_result.size));
         try patchLoadedElf(interp_base);
         interp.close();
     }
@@ -118,9 +129,12 @@ pub fn main() !void {
             elf.AT_ENTRY => entry,
             elf.AT_EXECFN => @intFromPtr(std.os.argv[arg_index]),
             elf.AT_SYSINFO_EHDR => blk: {
-                log.info("Found vDSO at 0x{x}", .{auxv[i].a_un.a_val});
-                try patchLoadedElf(auxv[i].a_un.a_val);
-                break :blk auxv[i].a_un.a_val;
+                const vdso_base = auxv[i].a_un.a_val;
+                log.info("Found vDSO at 0x{x}", .{vdso_base});
+                try patchLoadedElf(vdso_base);
+                break :blk vdso_base;
+                // NOTE: We do not need to block this, because it's already done by the initial
+                // `/proc/self/maps` pass.
             },
             elf.AT_EXECFD => {
                 @panic("Got AT_EXECFD auxv value");
@@ -163,77 +177,6 @@ pub fn main() !void {
     trampoline(final_entry, argc);
 }
 
-/// Loads all `PT_LOAD` segments of an ELF file into memory.
-///
-/// For `ET_EXEC` (non-PIE), segments are mapped at their fixed virtual addresses (`p_vaddr`).
-/// For `ET_DYN` (PIE), segments are mapped at a random base address chosen by the kernel.
-///
-/// It handles zero-initialized(e.g., .bss) sections by mapping anonymous memory and only reading
-/// `p_filesz` bytes from the file, ensuring `p_memsz` bytes are allocated.
-fn loadStaticElf(ehdr: elf.Header, file_reader: *std.fs.File.Reader) !usize {
-    // NOTE: In theory we could also just look at the first and last loadable segment because the
-    // ELF spec mandates these to be in ascending order of `p_vaddr`, but better be safe than sorry.
-    // https://gabi.xinuos.com/elf/08-pheader.html#:~:text=ascending%20order
-    const minva, const maxva = bounds: {
-        var minva: u64 = std.math.maxInt(u64);
-        var maxva: u64 = 0;
-        var phdrs = ehdr.iterateProgramHeaders(file_reader);
-        while (try phdrs.next()) |phdr| {
-            if (phdr.p_type != elf.PT_LOAD) continue;
-            minva = @min(minva, phdr.p_vaddr);
-            maxva = @max(maxva, phdr.p_vaddr + phdr.p_memsz);
-        }
-        minva = mem.alignBackward(usize, minva, page_size);
-        maxva = mem.alignForward(usize, maxva, page_size);
-        log.debug("Calculated bounds: minva=0x{x}, maxva=0x{x}", .{ minva, maxva });
-        break :bounds .{ minva, maxva };
-    };
-
-    // Check, that the needed memory region can be allocated as a whole. We do this
-    const dynamic = ehdr.type == elf.ET.DYN;
-    log.debug("ELF type is {s}", .{if (dynamic) "DYN" else "EXEC (static)"});
-    const hint = if (dynamic) null else @as(?[*]align(page_size) u8, @ptrFromInt(minva));
-    log.debug("mmap pre-flight hint: {*}", .{hint});
-    const base = try posix.mmap(
-        hint,
-        maxva - minva,
-        posix.PROT.WRITE,
-        .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED_NOREPLACE = !dynamic },
-        -1,
-        0,
-    );
-    log.debug("Pre-flight reservation at: {*}, size: 0x{x}", .{ base.ptr, base.len });
-
-    var phdrs = ehdr.iterateProgramHeaders(file_reader);
-    var phdr_idx: u32 = 0;
-    errdefer posix.munmap(base);
-    while (try phdrs.next()) |phdr| : (phdr_idx += 1) {
-        if (phdr.p_type != elf.PT_LOAD) continue;
-        if (phdr.p_memsz == 0) continue;
-
-        const offset = phdr.p_vaddr & (page_size - 1);
-        const size = mem.alignForward(usize, phdr.p_memsz + offset, page_size);
-        var start = mem.alignBackward(usize, phdr.p_vaddr, page_size);
-        const base_for_dyn = if (dynamic) @intFromPtr(base.ptr) else 0;
-        start += base_for_dyn;
-        log.debug(
-            "  - phdr[{}]: mapping 0x{x} - 0x{x} (vaddr=0x{x}, dyn_base=0x{x})",
-            .{ phdr_idx, start, start + size, phdr.p_vaddr, base_for_dyn },
-        );
-        const ptr: []align(page_size) u8 = @as([*]align(page_size) u8, @ptrFromInt(start))[0..size];
-        // TODO: we should likely just use mmap instead because then not touched memory isn't loaded
-        // unnecessarily
-        try file_reader.seekTo(phdr.p_offset);
-        if (try file_reader.read(ptr[offset..][0..phdr.p_filesz]) != phdr.p_filesz)
-            return UnfinishedReadError.UnfinishedRead;
-
-        const protections = elfToMmapProt(phdr.p_flags);
-        try posix.mprotect(ptr, protections);
-    }
-    log.debug("loadElf returning base: 0x{x}", .{@intFromPtr(base.ptr)});
-    return @intFromPtr(base.ptr);
-}
-
 fn patchLoadedElf(base: usize) !void {
     const ehdr = @as(*const elf.Ehdr, @ptrFromInt(base));
     if (!mem.eql(u8, ehdr.e_ident[0..4], elf.MAGIC)) return error.InvalidElfMagic;
@@ -263,18 +206,9 @@ fn patchLoadedElf(base: usize) !void {
 
         const region = @as([*]align(page_size) u8, @ptrFromInt(page_start))[0..size];
 
-        try Patcher.patchRegion(region);
-        try posix.mprotect(region, elfToMmapProt(phdr.p_flags));
+        try patcher.patchRegion(region);
+        try posix.mprotect(region, loader.elfToMmapProt(phdr.p_flags));
     }
-}
-
-/// Converts ELF program header protection flags to mmap protection flags.
-fn elfToMmapProt(elf_prot: u64) u32 {
-    var result: u32 = posix.PROT.NONE;
-    if ((elf_prot & elf.PF_R) != 0) result |= posix.PROT.READ;
-    if ((elf_prot & elf.PF_W) != 0) result |= posix.PROT.WRITE;
-    if ((elf_prot & elf.PF_X) != 0) result |= posix.PROT.EXEC;
-    return result;
 }
 
 /// Opens the file by either opening via a (absolute or relative) path or searching through `PATH`
@@ -317,10 +251,50 @@ fn trampoline(entry: usize, sp: [*]usize) noreturn {
     unreachable;
 }
 
+fn bootstrapMemoryMap(p: *Patcher) !void {
+    {
+        var min_addr: u64 = 0x10000;
+        if (std.fs.openFileAbsolute("/proc/sys/vm/mmap_min_addr", .{})) |file| {
+            defer file.close();
+            var buf: [32]u8 = undefined;
+            if (file.readAll(&buf)) |len| {
+                const trimmed = std.mem.trim(u8, buf[0..len], " \n\r\t");
+                if (std.fmt.parseInt(u64, trimmed, 10)) |val| {
+                    min_addr = val;
+                } else |_| {}
+            } else |_| {}
+        } else |_| {}
+        try p.address_allocator.block(.{ .start = 0, .end = @intCast(min_addr) });
+    }
+
+    {
+        var maps_file = try std.fs.openFileAbsolute("/proc/self/maps", .{});
+        defer maps_file.close();
+        var buf: [512]u8 = undefined;
+        var reader = maps_file.reader(&buf);
+        while (true) {
+            const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => |e| return reader.err orelse e,
+                else => |e| return e,
+            };
+            std.debug.print("{s}", .{line});
+            const dash = mem.indexOfScalar(u8, line, '-') orelse continue;
+            const space = mem.indexOfScalar(u8, line, ' ') orelse continue;
+            assert(space > dash);
+            const start = std.fmt.parseInt(u64, line[0..dash], 16) catch unreachable;
+            const end = std.fmt.parseInt(u64, line[dash + 1 .. space], 16) catch unreachable;
+            // TODO: remove when Range is `u64`
+            try p.address_allocator.block(.{
+                .start = @as(u63, @truncate(start)),
+                .end = @as(u63, @truncate(end)),
+            });
+        }
+    }
+}
+
 test {
-    _ = @import("AddressAllocator.zig");
-    _ = @import("Range.zig");
-    _ = @import("PatchLocationIterator.zig");
+    _ = @import("Patcher.zig");
 }
 
 // TODO: make this be passed in from the build system

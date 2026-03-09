@@ -1,10 +1,11 @@
 const std = @import("std");
 const linux = std.os.linux;
 const posix = std.posix;
-const Patcher = @import("Patcher.zig");
-const assert = std.debug.assert;
 
+const assert = std.debug.assert;
 const page_size = std.heap.pageSize();
+
+const main = @import("main.zig");
 
 const log = std.log.scoped(.syscalls);
 
@@ -114,7 +115,7 @@ export fn syscall_handler(ctx: *SavedContext) callconv(.c) void {
             // mmap addresses are always page aligned
             const ptr = @as([*]align(page_size) u8, @ptrFromInt(addr));
             // Check if we can patch it
-            Patcher.patchRegion(ptr[0..len]) catch |err| {
+            main.patcher.patchRegion(ptr[0..len]) catch |err| {
                 std.log.warn("JIT Patching failed: {}", .{err});
             };
 
@@ -132,7 +133,7 @@ export fn syscall_handler(ctx: *SavedContext) callconv(.c) void {
                 // mprotect requires addr to be page aligned.
                 if (len > 0 and std.mem.isAligned(addr, page_size)) {
                     const ptr = @as([*]align(page_size) u8, @ptrFromInt(addr));
-                    Patcher.patchRegion(ptr[0..len]) catch |err| {
+                    main.patcher.patchRegion(ptr[0..len]) catch |err| {
                         std.log.warn("mprotect Patching failed: {}", .{err});
                     };
                     // patchRegion leaves it R|W.
@@ -250,7 +251,7 @@ fn isProcSelfExe(path: [*:0]const u8) bool {
 }
 
 fn handleReadlink(buf_addr: u64, buf_size: u64, ctx: *SavedContext) void {
-    const target = Patcher.target_exec_path;
+    const target = main.target_exec_path;
     const len = @min(target.len, buf_size);
     const dest = @as([*]u8, @ptrFromInt(buf_addr));
     @memcpy(dest[0..len], target[0..len]);

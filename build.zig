@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) !void {
     try compileTestApplications(b, target, optimize, false, true);
     try compileTestApplications(b, target, optimize, true, true);
 
-    const exe_tests = b.addTest(.{ .root_module = mod });
+    const exe_tests = b.addTest(.{ .root_module = mod, .use_llvm = true });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(b.getInstallStep());

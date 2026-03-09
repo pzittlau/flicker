@@ -17,16 +17,6 @@ pub fn size(range: Range) u64 {
     return @intCast(range.end - range.start);
 }
 
-pub fn alignTo(range: Range, alignment: u64) Range {
-    assert(range.end >= range.start);
-    assert(std.math.isPowerOfTwo(alignment));
-    assert(alignment <= std.math.maxInt(i64));
-    const lower = std.mem.alignBackward(i64, range.start, @intCast(alignment));
-    const upper = std.mem.alignForward(i64, range.end, @intCast(alignment));
-    assert(upper >= lower);
-    return .{ .start = lower, .end = upper };
-}
-
 pub fn overlaps(range: Range, other: Range) bool {
     assert(range.end >= range.start);
     assert(other.end >= other.start);
@@ -52,18 +42,17 @@ pub fn touches(range: Range, other: Range) bool {
 }
 
 /// Ranges are considered equal if they touch.
-pub fn compare(lhs: Range, rhs: Range) std.math.Order {
+pub fn compareTouching(lhs: Range, rhs: Range) std.math.Order {
     assert(lhs.end >= lhs.start);
     assert(rhs.end >= rhs.start);
     return if (lhs.start > rhs.end) .gt else if (lhs.end < rhs.start) .lt else .eq;
 }
 
-pub fn getStart(range: Range, T: type) T {
-    return @intCast(range.start);
-}
-
-pub fn getEnd(range: Range, T: type) T {
-    return @intCast(range.end);
+/// Ranges are considered equal if they overlap.
+pub fn compareOverlapping(lhs: Range, rhs: Range) std.math.Order {
+    assert(lhs.end >= lhs.start);
+    assert(rhs.end >= rhs.start);
+    return if (lhs.start >= rhs.end) .gt else if (lhs.end <= rhs.start) .lt else .eq;
 }
 
 pub fn format(
@@ -73,23 +62,21 @@ pub fn format(
     try writer.print(".{{ .start = 0x{x}, .end = 0x{x} }}", .{ self.start, self.end });
 }
 
+pub fn fromSlice(T: type, slice: []T) Range {
+    const start = @intFromPtr(slice.ptr);
+    return .{
+        .start = @intCast(start),
+        .end = @intCast(start + slice.len * @sizeOf(T)),
+    };
+}
+
+pub fn fromPtr(ptr: [*]u8, len: usize) Range {
+    return .fromSlice(u8, ptr[0..len]);
+}
+
 test "AddressRange size" {
     const range = Range{ .start = 100, .end = 250 };
     try std.testing.expectEqual(@as(u64, 150), range.size());
-}
-
-test "AddressRange alignTo unaligned" {
-    const range = Range{ .start = 101, .end = 199 };
-    const aligned = range.alignTo(16);
-    try std.testing.expectEqual(@as(i64, 96), aligned.start);
-    try std.testing.expectEqual(@as(i64, 208), aligned.end);
-}
-
-test "AddressRange alignTo already aligned" {
-    const range = Range{ .start = 64, .end = 128 };
-    const aligned = range.alignTo(64);
-    try std.testing.expectEqual(@as(i64, 64), aligned.start);
-    try std.testing.expectEqual(@as(i64, 128), aligned.end);
 }
 
 test "AddressRange no overlap before" {
